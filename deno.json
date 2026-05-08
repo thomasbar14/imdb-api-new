@@ -1,0 +1,10 @@
+{
+  "tasks": {
+    "start": "deno run --allow-net --allow-env api/main.ts"
+  },
+  "deploy": {
+    "project": "imdb-api-new",
+    "include": ["api/", "etl/", "schema.sql", "README.md"],
+    "exclude": [".github/"]
+  }
+}
