@@ -90,50 +90,40 @@ def transform_basics(input_path, output_path):
     kept = 0
     skipped = 0
     with gzip.open(input_path, "rt", encoding="utf-8") as f_in, \
-         open(output_path, "w", encoding="utf-8", newline="") as f_out:
-        reader = csv.DictReader(f_in, delimiter="\t")
+         open(output_path, "w", encoding="utf-8", newline="", buffering=1 << 20) as f_out:
+        reader = csv.reader(f_in, delimiter="\t")
+        header = next(reader)
+        idx = {col: i for i, col in enumerate(header)}
+        i_tconst = idx["tconst"]
+        i_type   = idx["titleType"]
+        i_title  = idx["primaryTitle"]
+        i_year   = idx["startYear"]
+        i_runtime = idx["runtimeMinutes"]
+        i_genres = idx["genres"]
         for row in reader:
             total += 1
-            ttype = row.get("titleType", "")
+            ttype = row[i_type]
             if ttype not in KEEP_TYPES:
                 continue
-            start_year = row.get("startYear", "")
-            runtime = row.get("runtimeMinutes", "")
-            genres = row.get("genres", "")
+            start_year = row[i_year]
+            runtime = row[i_runtime]
             if not is_valid_int(start_year) or not is_valid_int(runtime):
                 skipped += 1
                 continue
             kept += 1
             f_out.write("\t".join([
-                sanitize(row.get("tconst", "")),
+                sanitize(row[i_tconst]),
                 sanitize(ttype),
-                sanitize(row.get("primaryTitle", "")),
+                sanitize(row[i_title]),
                 sanitize(start_year),
                 sanitize(runtime),
-                sanitize(genres),
+                sanitize(row[i_genres]),
             ]) + "\n")
             if kept % 200000 == 0:
                 print(f"[TRANSFORM] title.basics {kept:,} kept ({total:,} scanned, {skipped:,} skipped)")
     print(f"[TRANSFORM] title.basics complete: {kept:,} kept / {total:,} total, {skipped:,} skipped → {output_path}")
     return kept
 
-
-def transform_simple(input_path, output_path, columns):
-    print(f"[TRANSFORM] Starting {os.path.basename(input_path)} ...")
-    count = 0
-    with gzip.open(input_path, "rt", encoding="utf-8") as f_in, \
-         open(output_path, "w", encoding="utf-8", newline="") as f_out:
-        reader = csv.DictReader(f_in, delimiter="\t")
-        for row in reader:
-            count += 1
-            f_out.write("\t".join([
-                sanitize(row[col])
-                for col in columns
-            ]) + "\n")
-            if count % 500000 == 0:
-                print(f"[TRANSFORM] {os.path.basename(input_path)} {count:,} rows")
-    print(f"[TRANSFORM] {os.path.basename(input_path)} complete: {count:,} rows → {output_path}")
-    return count
 
 
 def init_state_table(conn):
@@ -152,9 +142,11 @@ def create_staging_tables(conn):
     print("[DB] Creating staging tables ...")
     with conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS titles_new, episodes_new, ratings_new CASCADE")
+        # No PK/unique constraints during load — added in bulk by build_indexes()
+        # after all data is loaded, which is 5-10x faster than per-row index maintenance.
         cur.execute("""
             CREATE TABLE titles_new (
-                tconst VARCHAR(10) PRIMARY KEY,
+                tconst VARCHAR(10) NOT NULL,
                 title_type VARCHAR(20) NOT NULL,
                 primary_title TEXT NOT NULL,
                 start_year SMALLINT,
@@ -164,7 +156,7 @@ def create_staging_tables(conn):
         """)
         cur.execute("""
             CREATE TABLE episodes_new (
-                tconst VARCHAR(10) PRIMARY KEY,
+                tconst VARCHAR(10) NOT NULL,
                 parent_tconst VARCHAR(10) NOT NULL,
                 season_number SMALLINT,
                 episode_number SMALLINT
@@ -172,7 +164,7 @@ def create_staging_tables(conn):
         """)
         cur.execute("""
             CREATE TABLE ratings_new (
-                tconst VARCHAR(10) PRIMARY KEY,
+                tconst VARCHAR(10) NOT NULL,
                 average_rating REAL NOT NULL,
                 num_votes INTEGER NOT NULL
             )
@@ -183,24 +175,41 @@ def create_staging_tables(conn):
 def copy_from_tsv(conn, table, path, columns):
     print(f"[DB] Bulk copying into {table} ...")
     cols = ", ".join(columns)
-    # FORMAT TEXT with default \N NULL marker (fastest PostgreSQL COPY path)
     sql = f"COPY {table} ({cols}) FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t')"
     with conn.cursor() as cur, open(path, "r", encoding="utf-8") as f:
         cur.copy_expert(sql, f)
     conn.commit()
-    with conn.cursor() as cur:
-        cur.execute(f"SELECT COUNT(*) FROM {table}")
-        count = cur.fetchone()[0]
-    print(f"[DB] Copied {table}: {count:,} rows")
+    print(f"[DB] COPY into {table} complete.")
+
+
+def stream_gz_to_table(conn, table, gz_path, columns):
+    """Stream a gzip TSV file directly to PostgreSQL COPY, skipping the header row.
+
+    Safe for files whose values cannot contain tabs/newlines (IDs, numbers).
+    IMDb uses \\N natively for NULLs, which matches PostgreSQL TEXT COPY format.
+    """
+    print(f"[DB] Streaming {os.path.basename(gz_path)} → {table} ...")
+    cols = ", ".join(columns)
+    sql = f"COPY {table} ({cols}) FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t')"
+    with gzip.open(gz_path, "rb") as gz_file:
+        gz_file.readline()  # skip header row
+        with conn.cursor() as cur:
+            cur.copy_expert(sql, gz_file)
+    conn.commit()
+    print(f"[DB] Stream COPY into {table} complete.")
 
 
 def build_indexes(conn):
-    print("[DB] Building indexes ...")
+    print("[DB] Building indexes and primary keys ...")
     with conn.cursor() as cur:
-        cur.execute("CREATE INDEX idx_titles_type ON titles_new(title_type)")
+        # Add PKs in bulk after load — much faster than per-row index maintenance during COPY
+        cur.execute("ALTER TABLE titles_new   ADD PRIMARY KEY (tconst)")
+        cur.execute("ALTER TABLE episodes_new ADD PRIMARY KEY (tconst)")
+        cur.execute("ALTER TABLE ratings_new  ADD PRIMARY KEY (tconst)")
+        cur.execute("CREATE INDEX idx_titles_type     ON titles_new(title_type)")
         cur.execute("CREATE INDEX idx_episodes_parent ON episodes_new(parent_tconst)")
     conn.commit()
-    print("[DB] Indexes built.")
+    print("[DB] Indexes and primary keys built.")
 
 
 def swap_tables(conn):
@@ -214,11 +223,11 @@ def swap_tables(conn):
     print("[DB] Tables swapped.")
 
 
-def run_full_load(conn, basics_tsv, episode_tsv, ratings_tsv):
+def run_full_load(conn, basics_tsv, episode_gz, ratings_gz):
     create_staging_tables(conn)
     copy_from_tsv(conn, "titles_new", basics_tsv, ("tconst", "title_type", "primary_title", "start_year", "runtime_minutes", "genres"))
-    copy_from_tsv(conn, "episodes_new", episode_tsv, ("tconst", "parent_tconst", "season_number", "episode_number"))
-    copy_from_tsv(conn, "ratings_new", ratings_tsv, ("tconst", "average_rating", "num_votes"))
+    stream_gz_to_table(conn, "episodes_new", episode_gz, ("tconst", "parent_tconst", "season_number", "episode_number"))
+    stream_gz_to_table(conn, "ratings_new", ratings_gz, ("tconst", "average_rating", "num_votes"))
     build_indexes(conn)
     swap_tables(conn)
 
@@ -254,14 +263,6 @@ def main():
                 print("[SKIP] All files unchanged. No database update needed.")
                 return
 
-            basics_tsv = os.path.join(tmpdir, "basics.tsv")
-            episode_tsv = os.path.join(tmpdir, "episode.tsv")
-            ratings_tsv = os.path.join(tmpdir, "ratings.tsv")
-
-            transform_basics(paths["basics"], basics_tsv)
-            transform_simple(paths["episode"], episode_tsv, ["tconst", "parentTconst", "seasonNumber", "episodeNumber"])
-            transform_simple(paths["ratings"], ratings_tsv, ["tconst", "averageRating", "numVotes"])
-
             # If this is the very first run (no live tables exist), do a full load
             with conn.cursor() as cur:
                 cur.execute("""
@@ -272,35 +273,35 @@ def main():
                 """)
                 has_live = cur.fetchone()[0]
 
-            # For simplicity and correctness: full rebuild if any structural file changed,
-            # fast ratings upsert if ONLY ratings changed.
+            # Full rebuild if any structural file changed;
+            # ratings-only staging swap if ONLY ratings changed.
             only_ratings_changed = changed["ratings"] and not changed["basics"] and not changed["episode"] and has_live
 
             if only_ratings_changed:
-                print("[INCREMENTAL] Only ratings changed. Fast upsert path ...")
+                print("[INCREMENTAL] Only ratings changed. Ratings staging swap ...")
                 with conn.cursor() as cur:
+                    cur.execute("DROP TABLE IF EXISTS ratings_new CASCADE")
                     cur.execute("""
-                        CREATE TEMP TABLE ratings_tmp (
-                            tconst VARCHAR(10) PRIMARY KEY,
+                        CREATE TABLE ratings_new (
+                            tconst VARCHAR(10) NOT NULL,
                             average_rating REAL NOT NULL,
                             num_votes INTEGER NOT NULL
-                        ) ON COMMIT DROP
+                        )
                     """)
                 conn.commit()
-                copy_from_tsv(conn, "ratings_tmp", ratings_tsv, ("tconst", "average_rating", "num_votes"))
+                stream_gz_to_table(conn, "ratings_new", paths["ratings"], ("tconst", "average_rating", "num_votes"))
                 with conn.cursor() as cur:
-                    cur.execute("""
-                        INSERT INTO ratings (tconst, average_rating, num_votes)
-                        SELECT tconst, average_rating, num_votes FROM ratings_tmp
-                        ON CONFLICT (tconst) DO UPDATE SET
-                            average_rating = EXCLUDED.average_rating,
-                            num_votes = EXCLUDED.num_votes
-                    """)
+                    cur.execute("ALTER TABLE ratings_new ADD PRIMARY KEY (tconst)")
+                    cur.execute("DROP TABLE IF EXISTS ratings_old CASCADE")
+                    cur.execute("ALTER TABLE IF EXISTS ratings RENAME TO ratings_old")
+                    cur.execute("ALTER TABLE ratings_new RENAME TO ratings")
                 conn.commit()
-                print("[INCREMENTAL] Ratings upserted.")
+                print("[INCREMENTAL] Ratings swap complete.")
             else:
                 # Full rebuild path (first run OR basics/episode changed)
-                run_full_load(conn, basics_tsv, episode_tsv, ratings_tsv)
+                basics_tsv = os.path.join(tmpdir, "basics.tsv")
+                transform_basics(paths["basics"], basics_tsv)
+                run_full_load(conn, basics_tsv, paths["episode"], paths["ratings"])
 
             # Update stored hashes
             for key, (filename, state_name) in FILES.items():
