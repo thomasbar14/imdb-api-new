@@ -1,12 +1,20 @@
 import csv
 import gzip
+import logging
 import os
 import shutil
 import sys
 import tempfile
 import time
+import traceback
 import urllib.request
 import psycopg2
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="[%(levelname)s] %(message)s",
+    stream=sys.stdout,
+)
 
 BASE_URL = "https://datasets.imdbws.com/"
 FILES = {
@@ -213,4 +221,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logging.error(f"ETL process failed: {e}")
+        traceback.print_exc()
+        sys.exit(1)
