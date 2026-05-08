@@ -1,0 +1,184 @@
+import csv
+import gzip
+import os
+import shutil
+import sys
+import tempfile
+import urllib.request
+import psycopg2
+
+BASE_URL = "https://datasets.imdbws.com/"
+FILES = {
+    "basics": "title.basics.tsv.gz",
+    "ratings": "title.ratings.tsv.gz",
+    "episode": "title.episode.tsv.gz",
+}
+KEEP_TYPES = {"tvEpisode", "tvSeries", "tvMiniSeries", "movie"}
+
+
+def get_conn():
+    url = os.environ["DATABASE_URL"]
+    return psycopg2.connect(url)
+
+
+def download_file(filename):
+    url = BASE_URL + filename
+    local_path = os.path.join(tempfile.gettempdir(), filename)
+    print(f"Downloading {url} ...")
+    urllib.request.urlretrieve(url, local_path)
+    print(f"Saved to {local_path}")
+    return local_path
+
+
+def transform_basics(input_path, output_path):
+    print("Transforming title.basics ...")
+    with gzip.open(input_path, "rt", encoding="utf-8") as f_in, \
+         open(output_path, "w", encoding="utf-8", newline="") as f_out:
+        reader = csv.DictReader(f_in, delimiter="\t")
+        writer = csv.writer(f_out, delimiter="\t", lineterminator="\n")
+        for row in reader:
+            ttype = row["titleType"]
+            if ttype not in KEEP_TYPES:
+                continue
+            writer.writerow([
+                row["tconst"],
+                ttype,
+                row["primaryTitle"],
+                row["startYear"] if row["startYear"] != "\\N" else "",
+                row["runtimeMinutes"] if row["runtimeMinutes"] != "\\N" else "",
+                row["genres"] if row["genres"] != "\\N" else "",
+            ])
+    print(f"Written {output_path}")
+
+
+def transform_simple(input_path, output_path, columns):
+    print(f"Transforming {os.path.basename(input_path)} ...")
+    with gzip.open(input_path, "rt", encoding="utf-8") as f_in, \
+         open(output_path, "w", encoding="utf-8", newline="") as f_out:
+        reader = csv.DictReader(f_in, delimiter="\t")
+        writer = csv.writer(f_out, delimiter="\t", lineterminator="\n")
+        for row in reader:
+            writer.writerow([
+                row[col] if row[col] != "\\N" else ""
+                for col in columns
+            ])
+    print(f"Written {output_path}")
+
+
+def create_staging_tables(conn):
+    print("Creating staging tables ...")
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS titles_new, episodes_new, ratings_new CASCADE")
+        cur.execute("""
+            CREATE TABLE titles_new (
+                id SERIAL,
+                tconst VARCHAR(10) UNIQUE NOT NULL,
+                title_type VARCHAR(20) NOT NULL,
+                primary_title TEXT NOT NULL,
+                start_year SMALLINT,
+                runtime_minutes SMALLINT,
+                genres TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE episodes_new (
+                id SERIAL,
+                tconst VARCHAR(10) UNIQUE NOT NULL,
+                parent_tconst VARCHAR(10) NOT NULL,
+                season_number SMALLINT,
+                episode_number SMALLINT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE ratings_new (
+                tconst VARCHAR(10) PRIMARY KEY,
+                average_rating REAL NOT NULL,
+                num_votes INTEGER NOT NULL
+            )
+        """)
+    conn.commit()
+
+
+def copy_from_csv(conn, table, path, columns):
+    print(f"Copying into {table} from {path} ...")
+    with conn.cursor() as cur, open(path, "r", encoding="utf-8") as f:
+        cur.copy_from(f, table, columns=columns, null="")
+    conn.commit()
+    print(f"Copied {table}")
+
+
+def build_indexes(conn):
+    print("Building indexes on staging tables ...")
+    with conn.cursor() as cur:
+        cur.execute("ALTER TABLE titles_new ADD PRIMARY KEY (id)")
+        cur.execute("ALTER TABLE episodes_new ADD PRIMARY KEY (id)")
+        cur.execute("CREATE INDEX idx_titles_type ON titles_new(title_type)")
+        cur.execute("CREATE INDEX idx_episodes_parent ON episodes_new(parent_tconst)")
+        cur.execute("CREATE INDEX idx_titles_search ON titles_new USING gin(to_tsvector('english', primary_title))")
+    conn.commit()
+    print("Indexes built.")
+
+
+def swap_tables(conn):
+    print("Swapping tables atomically ...")
+    with conn.cursor() as cur:
+        for name in ["titles", "episodes", "ratings"]:
+            cur.execute(f"DROP TABLE IF EXISTS {name}_old CASCADE")
+            cur.execute(f"ALTER TABLE IF EXISTS {name} RENAME TO {name}_old")
+            cur.execute(f"ALTER TABLE {name}_new RENAME TO {name}")
+    conn.commit()
+    print("Swapped.")
+
+
+def analyze_tables(conn):
+    print("Running ANALYZE ...")
+    with conn.cursor() as cur:
+        cur.execute("ANALYZE titles")
+        cur.execute("ANALYZE episodes")
+        cur.execute("ANALYZE ratings")
+    conn.commit()
+    print("ANALYZE done.")
+
+
+def main():
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        print("DATABASE_URL not set")
+        sys.exit(1)
+
+    tmpdir = tempfile.mkdtemp()
+    try:
+        paths = {}
+        for key, filename in FILES.items():
+            paths[key] = download_file(filename)
+
+        basics_csv = os.path.join(tmpdir, "basics.csv")
+        episode_csv = os.path.join(tmpdir, "episode.csv")
+        ratings_csv = os.path.join(tmpdir, "ratings.csv")
+
+        transform_basics(paths["basics"], basics_csv)
+        transform_simple(paths["episode"], episode_csv, ["tconst", "parentTconst", "seasonNumber", "episodeNumber"])
+        transform_simple(paths["ratings"], ratings_csv, ["tconst", "averageRating", "numVotes"])
+
+        conn = get_conn()
+        try:
+            create_staging_tables(conn)
+            copy_from_csv(conn, "titles_new", basics_csv, ("tconst", "title_type", "primary_title", "start_year", "runtime_minutes", "genres"))
+            copy_from_csv(conn, "episodes_new", episode_csv, ("tconst", "parent_tconst", "season_number", "episode_number"))
+            copy_from_csv(conn, "ratings_new", ratings_csv, ("tconst", "average_rating", "num_votes"))
+            build_indexes(conn)
+            swap_tables(conn)
+            analyze_tables(conn)
+        finally:
+            conn.close()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        for key, filename in FILES.items():
+            p = os.path.join(tempfile.gettempdir(), filename)
+            if os.path.exists(p):
+                os.remove(p)
+        print("Cleanup complete.")
+
+
+if __name__ == "__main__":
+    main()
