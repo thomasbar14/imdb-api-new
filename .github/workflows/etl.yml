@@ -25,4 +25,5 @@ jobs:
       - name: Run ETL
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PYTHONUNBUFFERED: "1"
         run: python etl/main.py
