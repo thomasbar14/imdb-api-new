@@ -1,5 +1,6 @@
 import csv
 import gzip
+import hashlib
 import logging
 import os
 import shutil
@@ -18,9 +19,9 @@ logging.basicConfig(
 
 BASE_URL = "https://datasets.imdbws.com/"
 FILES = {
-    "basics": "title.basics.tsv.gz",
-    "ratings": "title.ratings.tsv.gz",
-    "episode": "title.episode.tsv.gz",
+    "basics": ("title.basics.tsv.gz", "basics"),
+    "ratings": ("title.ratings.tsv.gz", "ratings"),
+    "episode": ("title.episode.tsv.gz", "episode"),
 }
 KEEP_TYPES = {"tvEpisode", "tvSeries", "tvMiniSeries", "movie"}
 
@@ -28,6 +29,32 @@ KEEP_TYPES = {"tvEpisode", "tvSeries", "tvMiniSeries", "movie"}
 def get_conn():
     url = os.environ["DATABASE_URL"]
     return psycopg2.connect(url)
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def get_stored_hash(conn, name):
+    with conn.cursor() as cur:
+        cur.execute("SELECT hash FROM etl_state WHERE file_name = %s", (name,))
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def set_stored_hash(conn, name, h):
+    with conn.cursor() as cur:
+        cur.execute(
+            """INSERT INTO etl_state (file_name, hash, updated_at)
+               VALUES (%s, %s, NOW())
+               ON CONFLICT (file_name) DO UPDATE SET hash = EXCLUDED.hash, updated_at = NOW()""",
+            (name, h),
+        )
+    conn.commit()
 
 
 def download_file(filename):
@@ -41,9 +68,8 @@ def download_file(filename):
 
 
 def sanitize(value):
-    """Remove/replace problematic characters for PostgreSQL COPY."""
     if value is None:
-        return ""
+        return "\\N"
     # Replace literal tabs and newlines with spaces to prevent COPY breakage
     return value.replace("\t", " ").replace("\n", " ").replace("\r", "")
 
@@ -66,36 +92,30 @@ def transform_basics(input_path, output_path):
     with gzip.open(input_path, "rt", encoding="utf-8") as f_in, \
          open(output_path, "w", encoding="utf-8", newline="") as f_out:
         reader = csv.DictReader(f_in, delimiter="\t")
-        writer = csv.writer(f_out, delimiter="\t", lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
         for row in reader:
             total += 1
             ttype = row.get("titleType", "")
             if ttype not in KEEP_TYPES:
                 continue
-            
             start_year = row.get("startYear", "")
             runtime = row.get("runtimeMinutes", "")
             genres = row.get("genres", "")
-            
-            # Validate numeric fields to catch shifted/malformed rows
             if not is_valid_int(start_year) or not is_valid_int(runtime):
                 skipped += 1
-                if skipped <= 5:
-                    print(f"[WARN] Skipping malformed row {total}: tconst={row.get('tconst')}, startYear={start_year!r}, runtimeMinutes={runtime!r}, genres={genres!r}")
                 continue
-            
             kept += 1
-            writer.writerow([
+            f_out.write("\t".join([
                 sanitize(row.get("tconst", "")),
                 sanitize(ttype),
                 sanitize(row.get("primaryTitle", "")),
-                sanitize(start_year) if start_year != "\\N" else "",
-                sanitize(runtime) if runtime != "\\N" else "",
-                sanitize(genres) if genres != "\\N" else "",
-            ])
-            if kept % 100000 == 0:
-                print(f"[TRANSFORM] title.basics processed {kept:,} kept rows ({total:,} total scanned, {skipped:,} skipped)")
+                sanitize(start_year) if start_year != "\\N" else "\\N",
+                sanitize(runtime) if runtime != "\\N" else "\\N",
+                sanitize(genres) if genres != "\\N" else "\\N",
+            ]) + "\n")
+            if kept % 200000 == 0:
+                print(f"[TRANSFORM] title.basics {kept:,} kept ({total:,} scanned, {skipped:,} skipped)")
     print(f"[TRANSFORM] title.basics complete: {kept:,} kept / {total:,} total, {skipped:,} skipped → {output_path}")
+    return kept
 
 
 def transform_simple(input_path, output_path, columns):
@@ -104,16 +124,28 @@ def transform_simple(input_path, output_path, columns):
     with gzip.open(input_path, "rt", encoding="utf-8") as f_in, \
          open(output_path, "w", encoding="utf-8", newline="") as f_out:
         reader = csv.DictReader(f_in, delimiter="\t")
-        writer = csv.writer(f_out, delimiter="\t", lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
         for row in reader:
             count += 1
-            writer.writerow([
-                sanitize(row[col]) if row[col] != "\\N" else ""
+            f_out.write("\t".join([
+                sanitize(row[col]) if row[col] != "\\N" else "\\N"
                 for col in columns
-            ])
-            if count % 100000 == 0:
-                print(f"[TRANSFORM] {os.path.basename(input_path)} processed {count:,} rows")
+            ]) + "\n")
+            if count % 500000 == 0:
+                print(f"[TRANSFORM] {os.path.basename(input_path)} {count:,} rows")
     print(f"[TRANSFORM] {os.path.basename(input_path)} complete: {count:,} rows → {output_path}")
+    return count
+
+
+def init_state_table(conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS etl_state (
+                file_name VARCHAR(20) PRIMARY KEY,
+                hash VARCHAR(64) NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+    conn.commit()
 
 
 def create_staging_tables(conn):
@@ -122,8 +154,7 @@ def create_staging_tables(conn):
         cur.execute("DROP TABLE IF EXISTS titles_new, episodes_new, ratings_new CASCADE")
         cur.execute("""
             CREATE TABLE titles_new (
-                id SERIAL,
-                tconst VARCHAR(10) UNIQUE NOT NULL,
+                tconst VARCHAR(10) PRIMARY KEY,
                 title_type VARCHAR(20) NOT NULL,
                 primary_title TEXT NOT NULL,
                 start_year SMALLINT,
@@ -133,8 +164,7 @@ def create_staging_tables(conn):
         """)
         cur.execute("""
             CREATE TABLE episodes_new (
-                id SERIAL,
-                tconst VARCHAR(10) UNIQUE NOT NULL,
+                tconst VARCHAR(10) PRIMARY KEY,
                 parent_tconst VARCHAR(10) NOT NULL,
                 season_number SMALLINT,
                 episode_number SMALLINT
@@ -153,13 +183,11 @@ def create_staging_tables(conn):
 def copy_from_tsv(conn, table, path, columns):
     print(f"[DB] Bulk copying into {table} ...")
     cols = ", ".join(columns)
-    # We use FORMAT CSV with tab delimiter so PostgreSQL properly handles
-    # quoted fields (e.g. titles containing tabs or newlines) in our TSV output.
-    sql = f"COPY {table} ({cols}) FROM STDIN WITH (FORMAT CSV, DELIMITER E'\\t', QUOTE E'\"', NULL '')"
+    # FORMAT TEXT with \N as NULL marker is the fastest PostgreSQL COPY path
+    sql = f"COPY {table} ({cols}) FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t', NULL '\\\\N')"
     with conn.cursor() as cur, open(path, "r", encoding="utf-8") as f:
         cur.copy_expert(sql, f)
     conn.commit()
-    # Get row count
     with conn.cursor() as cur:
         cur.execute(f"SELECT COUNT(*) FROM {table}")
         count = cur.fetchone()[0]
@@ -167,13 +195,10 @@ def copy_from_tsv(conn, table, path, columns):
 
 
 def build_indexes(conn):
-    print("[DB] Building indexes on staging tables ...")
+    print("[DB] Building indexes ...")
     with conn.cursor() as cur:
-        cur.execute("ALTER TABLE titles_new ADD PRIMARY KEY (id)")
-        cur.execute("ALTER TABLE episodes_new ADD PRIMARY KEY (id)")
         cur.execute("CREATE INDEX idx_titles_type ON titles_new(title_type)")
         cur.execute("CREATE INDEX idx_episodes_parent ON episodes_new(parent_tconst)")
-        cur.execute("CREATE INDEX idx_titles_search ON titles_new USING gin(to_tsvector('english', primary_title))")
     conn.commit()
     print("[DB] Indexes built.")
 
@@ -189,14 +214,13 @@ def swap_tables(conn):
     print("[DB] Tables swapped.")
 
 
-def analyze_tables(conn):
-    print("[DB] Running ANALYZE ...")
-    with conn.cursor() as cur:
-        cur.execute("ANALYZE titles")
-        cur.execute("ANALYZE episodes")
-        cur.execute("ANALYZE ratings")
-    conn.commit()
-    print("[DB] ANALYZE done.")
+def run_full_load(conn, basics_tsv, episode_tsv, ratings_tsv):
+    create_staging_tables(conn)
+    copy_from_tsv(conn, "titles_new", basics_tsv, ("tconst", "title_type", "primary_title", "start_year", "runtime_minutes", "genres"))
+    copy_from_tsv(conn, "episodes_new", episode_tsv, ("tconst", "parent_tconst", "season_number", "episode_number"))
+    copy_from_tsv(conn, "ratings_new", ratings_tsv, ("tconst", "average_rating", "num_votes"))
+    build_indexes(conn)
+    swap_tables(conn)
 
 
 def main():
@@ -206,39 +230,91 @@ def main():
         sys.exit(1)
 
     start_time = time.time()
-    tmpdir = tempfile.mkdtemp()
+    conn = get_conn()
     try:
-        paths = {}
-        for key, filename in FILES.items():
-            paths[key] = download_file(filename)
+        print("[DB] Ensuring state table exists ...")
+        init_state_table(conn)
 
-        basics_tsv = os.path.join(tmpdir, "basics.tsv")
-        episode_tsv = os.path.join(tmpdir, "episode.tsv")
-        ratings_tsv = os.path.join(tmpdir, "ratings.tsv")
-
-        transform_basics(paths["basics"], basics_tsv)
-        transform_simple(paths["episode"], episode_tsv, ["tconst", "parentTconst", "seasonNumber", "episodeNumber"])
-        transform_simple(paths["ratings"], ratings_tsv, ["tconst", "averageRating", "numVotes"])
-
-        print("[DB] Connecting to database ...")
-        conn = get_conn()
+        tmpdir = tempfile.mkdtemp()
         try:
-            create_staging_tables(conn)
-            copy_from_tsv(conn, "titles_new", basics_tsv, ("tconst", "title_type", "primary_title", "start_year", "runtime_minutes", "genres"))
-            copy_from_tsv(conn, "episodes_new", episode_tsv, ("tconst", "parent_tconst", "season_number", "episode_number"))
-            copy_from_tsv(conn, "ratings_new", ratings_tsv, ("tconst", "average_rating", "num_votes"))
-            build_indexes(conn)
-            swap_tables(conn)
-            analyze_tables(conn)
+            paths = {}
+            hashes = {}
+            changed = {}
+
+            # Download all files and compute hashes
+            for key, (filename, state_name) in FILES.items():
+                paths[key] = download_file(filename)
+                hashes[key] = sha256_file(paths[key])
+                stored = get_stored_hash(conn, state_name)
+                changed[key] = (stored != hashes[key])
+                print(f"[HASH] {state_name}: current={hashes[key][:16]}... stored={stored[:16] if stored else 'None'} changed={changed[key]}")
+
+            # If nothing changed, exit immediately
+            if not any(changed.values()):
+                print("[SKIP] All files unchanged. No database update needed.")
+                return
+
+            basics_tsv = os.path.join(tmpdir, "basics.tsv")
+            episode_tsv = os.path.join(tmpdir, "episode.tsv")
+            ratings_tsv = os.path.join(tmpdir, "ratings.tsv")
+
+            transform_basics(paths["basics"], basics_tsv)
+            transform_simple(paths["episode"], episode_tsv, ["tconst", "parentTconst", "seasonNumber", "episodeNumber"])
+            transform_simple(paths["ratings"], ratings_tsv, ["tconst", "averageRating", "numVotes"])
+
+            # If this is the very first run (no live tables exist), do a full load
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables
+                        WHERE table_schema = 'public' AND table_name = 'titles'
+                    )
+                """)
+                has_live = cur.fetchone()[0]
+
+            # For simplicity and correctness: full rebuild if any structural file changed,
+            # fast ratings upsert if ONLY ratings changed.
+            only_ratings_changed = changed["ratings"] and not changed["basics"] and not changed["episode"] and has_live
+
+            if only_ratings_changed:
+                print("[INCREMENTAL] Only ratings changed. Fast upsert path ...")
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        CREATE TEMP TABLE ratings_tmp (
+                            tconst VARCHAR(10) PRIMARY KEY,
+                            average_rating REAL NOT NULL,
+                            num_votes INTEGER NOT NULL
+                        ) ON COMMIT DROP
+                    """)
+                conn.commit()
+                copy_from_tsv(conn, "ratings_tmp", ratings_tsv, ("tconst", "average_rating", "num_votes"))
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO ratings (tconst, average_rating, num_votes)
+                        SELECT tconst, average_rating, num_votes FROM ratings_tmp
+                        ON CONFLICT (tconst) DO UPDATE SET
+                            average_rating = EXCLUDED.average_rating,
+                            num_votes = EXCLUDED.num_votes
+                    """)
+                conn.commit()
+                print("[INCREMENTAL] Ratings upserted.")
+            else:
+                # Full rebuild path (first run OR basics/episode changed)
+                run_full_load(conn, basics_tsv, episode_tsv, ratings_tsv)
+
+            # Update stored hashes
+            for key, (filename, state_name) in FILES.items():
+                set_stored_hash(conn, state_name, hashes[key])
+
         finally:
-            conn.close()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            for key, (filename, _) in FILES.items():
+                p = os.path.join(tempfile.gettempdir(), filename)
+                if os.path.exists(p):
+                    os.remove(p)
+            print("[CLEANUP] Temporary files removed.")
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        for key, filename in FILES.items():
-            p = os.path.join(tempfile.gettempdir(), filename)
-            if os.path.exists(p):
-                os.remove(p)
-        print("[CLEANUP] Temporary files removed.")
+        conn.close()
 
     elapsed = time.time() - start_time
     print(f"[DONE] ETL completed in {elapsed:.0f} seconds ({elapsed/60:.1f} minutes)")

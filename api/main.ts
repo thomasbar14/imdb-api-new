@@ -115,15 +115,16 @@ app.get("/search", async (c) => {
     return c.json({ error: "Query must be at least 2 characters" }, 400);
   }
 
+  const pattern = `%${q}%`;
   const rows = await query(
     `SELECT t.tconst, t.title_type, t.primary_title, t.start_year,
             r.average_rating, r.num_votes
      FROM titles t
      LEFT JOIN ratings r ON t.tconst = r.tconst
-     WHERE to_tsvector('english', t.primary_title) @@ plainto_tsquery('english', $1)
+     WHERE t.primary_title ILIKE $1
      ORDER BY r.num_votes DESC NULLS LAST
      LIMIT 20`,
-    [q],
+    [pattern],
   );
 
   return c.json(rows);
