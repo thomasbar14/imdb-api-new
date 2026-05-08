@@ -150,9 +150,11 @@ def create_staging_tables(conn):
     conn.commit()
 
 
-def copy_from_csv(conn, table, path, columns):
+def copy_from_tsv(conn, table, path, columns):
     print(f"[DB] Bulk copying into {table} ...")
     cols = ", ".join(columns)
+    # We use FORMAT CSV with tab delimiter so PostgreSQL properly handles
+    # quoted fields (e.g. titles containing tabs or newlines) in our TSV output.
     sql = f"COPY {table} ({cols}) FROM STDIN WITH (FORMAT CSV, DELIMITER E'\\t', QUOTE E'\"', NULL '')"
     with conn.cursor() as cur, open(path, "r", encoding="utf-8") as f:
         cur.copy_expert(sql, f)
@@ -210,21 +212,21 @@ def main():
         for key, filename in FILES.items():
             paths[key] = download_file(filename)
 
-        basics_csv = os.path.join(tmpdir, "basics.csv")
-        episode_csv = os.path.join(tmpdir, "episode.csv")
-        ratings_csv = os.path.join(tmpdir, "ratings.csv")
+        basics_tsv = os.path.join(tmpdir, "basics.tsv")
+        episode_tsv = os.path.join(tmpdir, "episode.tsv")
+        ratings_tsv = os.path.join(tmpdir, "ratings.tsv")
 
-        transform_basics(paths["basics"], basics_csv)
-        transform_simple(paths["episode"], episode_csv, ["tconst", "parentTconst", "seasonNumber", "episodeNumber"])
-        transform_simple(paths["ratings"], ratings_csv, ["tconst", "averageRating", "numVotes"])
+        transform_basics(paths["basics"], basics_tsv)
+        transform_simple(paths["episode"], episode_tsv, ["tconst", "parentTconst", "seasonNumber", "episodeNumber"])
+        transform_simple(paths["ratings"], ratings_tsv, ["tconst", "averageRating", "numVotes"])
 
         print("[DB] Connecting to database ...")
         conn = get_conn()
         try:
             create_staging_tables(conn)
-            copy_from_csv(conn, "titles_new", basics_csv, ("tconst", "title_type", "primary_title", "start_year", "runtime_minutes", "genres"))
-            copy_from_csv(conn, "episodes_new", episode_csv, ("tconst", "parent_tconst", "season_number", "episode_number"))
-            copy_from_csv(conn, "ratings_new", ratings_csv, ("tconst", "average_rating", "num_votes"))
+            copy_from_tsv(conn, "titles_new", basics_tsv, ("tconst", "title_type", "primary_title", "start_year", "runtime_minutes", "genres"))
+            copy_from_tsv(conn, "episodes_new", episode_tsv, ("tconst", "parent_tconst", "season_number", "episode_number"))
+            copy_from_tsv(conn, "ratings_new", ratings_tsv, ("tconst", "average_rating", "num_votes"))
             build_indexes(conn)
             swap_tables(conn)
             analyze_tables(conn)
