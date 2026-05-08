@@ -14,7 +14,22 @@ app.use("*", async (c, next) => {
 });
 
 app.get("/", (c) => {
-  return c.json({ status: "ok", source: "imdb-non-commercial-datasets" });
+  return c.json({
+    status: "ok",
+    source: "imdb-non-commercial-datasets",
+    endpoints: {
+      "GET /title/:tconst": "Get any title (movie, series, episode) with rating",
+      "GET /series/:tconst": "Get series metadata + all episodes grouped by season",
+      "GET /series/:tconst/season/:season": "Get episodes for a specific season only",
+      "GET /search?q=...": "Full-text search over titles (min 2 chars)",
+    },
+    example_tconsts: {
+      "Game of Thrones (Series)": "tt0944947",
+      "Breaking Bad (Series)": "tt0903747",
+      "The Office (US)": "tt0386676",
+      "The Dark Knight (Movie)": "tt0468569",
+    },
+  });
 });
 
 app.get("/title/:tconst", async (c) => {
