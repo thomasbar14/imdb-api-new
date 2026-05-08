@@ -30,23 +30,31 @@ def download_file(filename):
     return local_path
 
 
+def sanitize(value):
+    """Remove/replace problematic characters for PostgreSQL COPY."""
+    if value is None:
+        return ""
+    # Replace literal tabs and newlines with spaces to prevent COPY breakage
+    return value.replace("\t", " ").replace("\n", " ").replace("\r", "")
+
+
 def transform_basics(input_path, output_path):
     print("Transforming title.basics ...")
     with gzip.open(input_path, "rt", encoding="utf-8") as f_in, \
          open(output_path, "w", encoding="utf-8", newline="") as f_out:
         reader = csv.DictReader(f_in, delimiter="\t")
-        writer = csv.writer(f_out, delimiter="\t", lineterminator="\n")
+        writer = csv.writer(f_out, delimiter="\t", lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
         for row in reader:
             ttype = row["titleType"]
             if ttype not in KEEP_TYPES:
                 continue
             writer.writerow([
-                row["tconst"],
-                ttype,
-                row["primaryTitle"],
-                row["startYear"] if row["startYear"] != "\\N" else "",
-                row["runtimeMinutes"] if row["runtimeMinutes"] != "\\N" else "",
-                row["genres"] if row["genres"] != "\\N" else "",
+                sanitize(row["tconst"]),
+                sanitize(ttype),
+                sanitize(row["primaryTitle"]),
+                sanitize(row["startYear"]) if row["startYear"] != "\\N" else "",
+                sanitize(row["runtimeMinutes"]) if row["runtimeMinutes"] != "\\N" else "",
+                sanitize(row["genres"]) if row["genres"] != "\\N" else "",
             ])
     print(f"Written {output_path}")
 
@@ -56,10 +64,10 @@ def transform_simple(input_path, output_path, columns):
     with gzip.open(input_path, "rt", encoding="utf-8") as f_in, \
          open(output_path, "w", encoding="utf-8", newline="") as f_out:
         reader = csv.DictReader(f_in, delimiter="\t")
-        writer = csv.writer(f_out, delimiter="\t", lineterminator="\n")
+        writer = csv.writer(f_out, delimiter="\t", lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
         for row in reader:
             writer.writerow([
-                row[col] if row[col] != "\\N" else ""
+                sanitize(row[col]) if row[col] != "\\N" else ""
                 for col in columns
             ])
     print(f"Written {output_path}")
@@ -101,8 +109,10 @@ def create_staging_tables(conn):
 
 def copy_from_csv(conn, table, path, columns):
     print(f"Copying into {table} from {path} ...")
+    cols = ", ".join(columns)
+    sql = f"COPY {table} ({cols}) FROM STDIN WITH (FORMAT CSV, DELIMITER E'\\t', QUOTE E'\"', NULL '')"
     with conn.cursor() as cur, open(path, "r", encoding="utf-8") as f:
-        cur.copy_from(f, table, columns=columns, null="")
+        cur.copy_expert(sql, f)
     conn.commit()
     print(f"Copied {table}")
 
