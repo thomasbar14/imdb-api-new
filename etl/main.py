@@ -68,7 +68,7 @@ def download_file(filename):
 
 
 def sanitize(value):
-    if value is None:
+    if value is None or value == "":
         return "\\N"
     # Replace literal tabs and newlines with spaces to prevent COPY breakage
     return value.replace("\t", " ").replace("\n", " ").replace("\r", "")
@@ -108,9 +108,9 @@ def transform_basics(input_path, output_path):
                 sanitize(row.get("tconst", "")),
                 sanitize(ttype),
                 sanitize(row.get("primaryTitle", "")),
-                sanitize(start_year) if start_year != "\\N" else "\\N",
-                sanitize(runtime) if runtime != "\\N" else "\\N",
-                sanitize(genres) if genres != "\\N" else "\\N",
+                sanitize(start_year),
+                sanitize(runtime),
+                sanitize(genres),
             ]) + "\n")
             if kept % 200000 == 0:
                 print(f"[TRANSFORM] title.basics {kept:,} kept ({total:,} scanned, {skipped:,} skipped)")
@@ -127,7 +127,7 @@ def transform_simple(input_path, output_path, columns):
         for row in reader:
             count += 1
             f_out.write("\t".join([
-                sanitize(row[col]) if row[col] != "\\N" else "\\N"
+                sanitize(row[col])
                 for col in columns
             ]) + "\n")
             if count % 500000 == 0:
@@ -183,8 +183,8 @@ def create_staging_tables(conn):
 def copy_from_tsv(conn, table, path, columns):
     print(f"[DB] Bulk copying into {table} ...")
     cols = ", ".join(columns)
-    # FORMAT TEXT with \N as NULL marker is the fastest PostgreSQL COPY path
-    sql = f"COPY {table} ({cols}) FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t', NULL '\\\\N')"
+    # FORMAT TEXT with default \N NULL marker (fastest PostgreSQL COPY path)
+    sql = f"COPY {table} ({cols}) FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t')"
     with conn.cursor() as cur, open(path, "r", encoding="utf-8") as f:
         cur.copy_expert(sql, f)
     conn.commit()
