@@ -4,6 +4,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import urllib.request
 import psycopg2
 
@@ -24,9 +25,10 @@ def get_conn():
 def download_file(filename):
     url = BASE_URL + filename
     local_path = os.path.join(tempfile.gettempdir(), filename)
-    print(f"Downloading {url} ...")
+    print(f"[DOWNLOAD] Starting {url} ...")
     urllib.request.urlretrieve(url, local_path)
-    print(f"Saved to {local_path}")
+    size_mb = os.path.getsize(local_path) / (1024 * 1024)
+    print(f"[DOWNLOAD] Saved {local_path} ({size_mb:.1f} MB)")
     return local_path
 
 
@@ -39,15 +41,19 @@ def sanitize(value):
 
 
 def transform_basics(input_path, output_path):
-    print("Transforming title.basics ...")
+    print("[TRANSFORM] Starting title.basics ...")
+    total = 0
+    kept = 0
     with gzip.open(input_path, "rt", encoding="utf-8") as f_in, \
          open(output_path, "w", encoding="utf-8", newline="") as f_out:
         reader = csv.DictReader(f_in, delimiter="\t")
         writer = csv.writer(f_out, delimiter="\t", lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
         for row in reader:
+            total += 1
             ttype = row["titleType"]
             if ttype not in KEEP_TYPES:
                 continue
+            kept += 1
             writer.writerow([
                 sanitize(row["tconst"]),
                 sanitize(ttype),
@@ -56,25 +62,31 @@ def transform_basics(input_path, output_path):
                 sanitize(row["runtimeMinutes"]) if row["runtimeMinutes"] != "\\N" else "",
                 sanitize(row["genres"]) if row["genres"] != "\\N" else "",
             ])
-    print(f"Written {output_path}")
+            if kept % 100000 == 0:
+                print(f"[TRANSFORM] title.basics processed {kept:,} kept rows ({total:,} total scanned)")
+    print(f"[TRANSFORM] title.basics complete: {kept:,} kept / {total:,} total → {output_path}")
 
 
 def transform_simple(input_path, output_path, columns):
-    print(f"Transforming {os.path.basename(input_path)} ...")
+    print(f"[TRANSFORM] Starting {os.path.basename(input_path)} ...")
+    count = 0
     with gzip.open(input_path, "rt", encoding="utf-8") as f_in, \
          open(output_path, "w", encoding="utf-8", newline="") as f_out:
         reader = csv.DictReader(f_in, delimiter="\t")
         writer = csv.writer(f_out, delimiter="\t", lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
         for row in reader:
+            count += 1
             writer.writerow([
                 sanitize(row[col]) if row[col] != "\\N" else ""
                 for col in columns
             ])
-    print(f"Written {output_path}")
+            if count % 100000 == 0:
+                print(f"[TRANSFORM] {os.path.basename(input_path)} processed {count:,} rows")
+    print(f"[TRANSFORM] {os.path.basename(input_path)} complete: {count:,} rows → {output_path}")
 
 
 def create_staging_tables(conn):
-    print("Creating staging tables ...")
+    print("[DB] Creating staging tables ...")
     with conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS titles_new, episodes_new, ratings_new CASCADE")
         cur.execute("""
@@ -108,17 +120,21 @@ def create_staging_tables(conn):
 
 
 def copy_from_csv(conn, table, path, columns):
-    print(f"Copying into {table} from {path} ...")
+    print(f"[DB] Bulk copying into {table} ...")
     cols = ", ".join(columns)
     sql = f"COPY {table} ({cols}) FROM STDIN WITH (FORMAT CSV, DELIMITER E'\\t', QUOTE E'\"', NULL '')"
     with conn.cursor() as cur, open(path, "r", encoding="utf-8") as f:
         cur.copy_expert(sql, f)
     conn.commit()
-    print(f"Copied {table}")
+    # Get row count
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM {table}")
+        count = cur.fetchone()[0]
+    print(f"[DB] Copied {table}: {count:,} rows")
 
 
 def build_indexes(conn):
-    print("Building indexes on staging tables ...")
+    print("[DB] Building indexes on staging tables ...")
     with conn.cursor() as cur:
         cur.execute("ALTER TABLE titles_new ADD PRIMARY KEY (id)")
         cur.execute("ALTER TABLE episodes_new ADD PRIMARY KEY (id)")
@@ -126,36 +142,37 @@ def build_indexes(conn):
         cur.execute("CREATE INDEX idx_episodes_parent ON episodes_new(parent_tconst)")
         cur.execute("CREATE INDEX idx_titles_search ON titles_new USING gin(to_tsvector('english', primary_title))")
     conn.commit()
-    print("Indexes built.")
+    print("[DB] Indexes built.")
 
 
 def swap_tables(conn):
-    print("Swapping tables atomically ...")
+    print("[DB] Swapping tables atomically ...")
     with conn.cursor() as cur:
         for name in ["titles", "episodes", "ratings"]:
             cur.execute(f"DROP TABLE IF EXISTS {name}_old CASCADE")
             cur.execute(f"ALTER TABLE IF EXISTS {name} RENAME TO {name}_old")
             cur.execute(f"ALTER TABLE {name}_new RENAME TO {name}")
     conn.commit()
-    print("Swapped.")
+    print("[DB] Tables swapped.")
 
 
 def analyze_tables(conn):
-    print("Running ANALYZE ...")
+    print("[DB] Running ANALYZE ...")
     with conn.cursor() as cur:
         cur.execute("ANALYZE titles")
         cur.execute("ANALYZE episodes")
         cur.execute("ANALYZE ratings")
     conn.commit()
-    print("ANALYZE done.")
+    print("[DB] ANALYZE done.")
 
 
 def main():
     db_url = os.environ.get("DATABASE_URL")
     if not db_url:
-        print("DATABASE_URL not set")
+        print("[ERROR] DATABASE_URL not set")
         sys.exit(1)
 
+    start_time = time.time()
     tmpdir = tempfile.mkdtemp()
     try:
         paths = {}
@@ -170,6 +187,7 @@ def main():
         transform_simple(paths["episode"], episode_csv, ["tconst", "parentTconst", "seasonNumber", "episodeNumber"])
         transform_simple(paths["ratings"], ratings_csv, ["tconst", "averageRating", "numVotes"])
 
+        print("[DB] Connecting to database ...")
         conn = get_conn()
         try:
             create_staging_tables(conn)
@@ -187,7 +205,11 @@ def main():
             p = os.path.join(tempfile.gettempdir(), filename)
             if os.path.exists(p):
                 os.remove(p)
-        print("Cleanup complete.")
+        print("[CLEANUP] Temporary files removed.")
+
+    elapsed = time.time() - start_time
+    print(f"[DONE] ETL completed in {elapsed:.0f} seconds ({elapsed/60:.1f} minutes)")
+    print(f"[DONE] Time: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}")
 
 
 if __name__ == "__main__":
