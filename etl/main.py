@@ -48,31 +48,54 @@ def sanitize(value):
     return value.replace("\t", " ").replace("\n", " ").replace("\r", "")
 
 
+def is_valid_int(value):
+    if value is None or value == "\\N" or value == "":
+        return True
+    try:
+        int(value)
+        return True
+    except ValueError:
+        return False
+
+
 def transform_basics(input_path, output_path):
     print("[TRANSFORM] Starting title.basics ...")
     total = 0
     kept = 0
+    skipped = 0
     with gzip.open(input_path, "rt", encoding="utf-8") as f_in, \
          open(output_path, "w", encoding="utf-8", newline="") as f_out:
         reader = csv.DictReader(f_in, delimiter="\t")
         writer = csv.writer(f_out, delimiter="\t", lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
         for row in reader:
             total += 1
-            ttype = row["titleType"]
+            ttype = row.get("titleType", "")
             if ttype not in KEEP_TYPES:
                 continue
+            
+            start_year = row.get("startYear", "")
+            runtime = row.get("runtimeMinutes", "")
+            genres = row.get("genres", "")
+            
+            # Validate numeric fields to catch shifted/malformed rows
+            if not is_valid_int(start_year) or not is_valid_int(runtime):
+                skipped += 1
+                if skipped <= 5:
+                    print(f"[WARN] Skipping malformed row {total}: tconst={row.get('tconst')}, startYear={start_year!r}, runtimeMinutes={runtime!r}, genres={genres!r}")
+                continue
+            
             kept += 1
             writer.writerow([
-                sanitize(row["tconst"]),
+                sanitize(row.get("tconst", "")),
                 sanitize(ttype),
-                sanitize(row["primaryTitle"]),
-                sanitize(row["startYear"]) if row["startYear"] != "\\N" else "",
-                sanitize(row["runtimeMinutes"]) if row["runtimeMinutes"] != "\\N" else "",
-                sanitize(row["genres"]) if row["genres"] != "\\N" else "",
+                sanitize(row.get("primaryTitle", "")),
+                sanitize(start_year) if start_year != "\\N" else "",
+                sanitize(runtime) if runtime != "\\N" else "",
+                sanitize(genres) if genres != "\\N" else "",
             ])
             if kept % 100000 == 0:
-                print(f"[TRANSFORM] title.basics processed {kept:,} kept rows ({total:,} total scanned)")
-    print(f"[TRANSFORM] title.basics complete: {kept:,} kept / {total:,} total → {output_path}")
+                print(f"[TRANSFORM] title.basics processed {kept:,} kept rows ({total:,} total scanned, {skipped:,} skipped)")
+    print(f"[TRANSFORM] title.basics complete: {kept:,} kept / {total:,} total, {skipped:,} skipped → {output_path}")
 
 
 def transform_simple(input_path, output_path, columns):
