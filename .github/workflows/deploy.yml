@@ -1,0 +1,24 @@
+name: Deploy to Deno Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to Deno Deploy
+        uses: denoland/deployctl@v1
+        with:
+          project: imdb-api-new
+          entrypoint: main.ts
+          include: api,etl,schema.sql,README.md,deno.json,main.ts
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
