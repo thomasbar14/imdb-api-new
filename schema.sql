@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS titles (
     title_type VARCHAR(20) NOT NULL,
     primary_title TEXT NOT NULL,
     start_year SMALLINT,
-    runtime_minutes SMALLINT,
+    runtime_minutes INTEGER,
     genres TEXT
 );
 
