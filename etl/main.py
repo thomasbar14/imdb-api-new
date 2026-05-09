@@ -198,38 +198,33 @@ def init_state_table(conn):
     conn.commit()
 
 
-def create_staging_tables(conn):
-    print("[DB] Creating staging tables ...")
-    with conn.cursor() as cur:
-        cur.execute("DROP TABLE IF EXISTS titles_new, episodes_new, ratings_new CASCADE")
-        # No PK/unique constraints during load — added in bulk by build_indexes()
-        # after all data is loaded, which is 5-10x faster than per-row index maintenance.
-        cur.execute("""
-            CREATE TABLE titles_new (
-                tconst VARCHAR(10) NOT NULL,
-                title_type VARCHAR(20) NOT NULL,
-                primary_title TEXT NOT NULL,
-                start_year SMALLINT,
-                runtime_minutes INTEGER,
-                genres TEXT
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE episodes_new (
-                tconst VARCHAR(10) NOT NULL,
-                parent_tconst VARCHAR(10) NOT NULL,
-                season_number INTEGER,
-                episode_number INTEGER
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE ratings_new (
-                tconst VARCHAR(10) NOT NULL,
-                average_rating REAL NOT NULL,
-                num_votes INTEGER NOT NULL
-            )
-        """)
-    conn.commit()
+TITLES_DDL = """
+    CREATE TABLE titles_new (
+        tconst VARCHAR(10) NOT NULL,
+        title_type VARCHAR(20) NOT NULL,
+        primary_title TEXT NOT NULL,
+        start_year SMALLINT,
+        runtime_minutes INTEGER,
+        genres TEXT
+    )
+"""
+
+EPISODES_DDL = """
+    CREATE TABLE episodes_new (
+        tconst VARCHAR(10) NOT NULL,
+        parent_tconst VARCHAR(10) NOT NULL,
+        season_number INTEGER,
+        episode_number INTEGER
+    )
+"""
+
+RATINGS_DDL = """
+    CREATE TABLE ratings_new (
+        tconst VARCHAR(10) NOT NULL,
+        average_rating REAL NOT NULL,
+        num_votes INTEGER NOT NULL
+    )
+"""
 
 
 def copy_from_tsv(conn, table, path, columns):
@@ -275,14 +270,24 @@ def _run_one(sql):
     print(f"[DB]   finished in {time.time() - s_start:.0f}s: {sql}")
 
 
-def build_indexes(conn):
-    print("[DB] Building indexes and primary keys ...")
-    statements = [
-        "ALTER TABLE titles_new   ADD PRIMARY KEY (tconst)",
-        "ALTER TABLE episodes_new ADD PRIMARY KEY (tconst)",
-        "ALTER TABLE ratings_new  ADD PRIMARY KEY (tconst)",
-        "CREATE INDEX idx_episodes_parent ON episodes_new(parent_tconst)",
-    ]
+def drop_old_tables(conn):
+    print("[DB] Dropping prior *_old tables to free disk ...")
+    with conn.cursor() as cur:
+        for name in ["titles", "episodes", "ratings"]:
+            cur.execute(f"DROP TABLE IF EXISTS {name}_old CASCADE")
+    conn.commit()
+
+
+def disable_txn_writes(conn):
+    """Skip Yugabyte's distributed-txn machinery for the staging COPYs.
+    Staging tables aren't visible to readers until the per-phase swap renames
+    them, so per-row transactional guarantees buy nothing here."""
+    with conn.cursor() as cur:
+        cur.execute("SET yb_disable_transactional_writes = ON")
+    conn.commit()
+
+
+def _run_indexes_parallel(statements):
     start = time.time()
     completed = [0]
     done = threading.Event()
@@ -294,52 +299,69 @@ def build_indexes(conn):
     hb = threading.Thread(target=heartbeat, daemon=True)
     hb.start()
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(statements)) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(statements))) as pool:
             futures = [pool.submit(_run_one, s) for s in statements]
             for fut in concurrent.futures.as_completed(futures):
                 fut.result()
                 completed[0] += 1
     finally:
         done.set()
-    print(f"[DB] Indexes and primary keys built in {time.time() - start:.0f}s.")
+    print(f"[DB] Indexes built in {time.time() - start:.0f}s.")
 
 
-def drop_old_tables(conn):
-    print("[DB] Dropping prior *_old tables to free disk ...")
+def load_and_swap_one(conn, name, ddl, source, columns, extra_indexes=()):
+    """Load → PK → extra indexes → swap → drop-old, all for one table.
+
+    Caps disk footprint at live{titles,episodes,ratings} + one staging table.
+    `source` is ("tsv", path) or ("gz", path).
+    """
+    print(f"[DB] === Phase: {name} ===")
+    phase_start = time.time()
+
     with conn.cursor() as cur:
-        for name in ["titles", "episodes", "ratings"]:
-            cur.execute(f"DROP TABLE IF EXISTS {name}_old CASCADE")
+        cur.execute(f"DROP TABLE IF EXISTS {name}_new CASCADE")
+        cur.execute(ddl)
+    conn.commit()
+    disable_txn_writes(conn)
+
+    kind, path = source
+    if kind == "tsv":
+        copy_from_tsv(conn, f"{name}_new", path, columns)
+    elif kind == "gz":
+        stream_gz_to_table(conn, f"{name}_new", path, columns)
+    else:
+        raise ValueError(f"unknown source kind: {kind}")
+
+    pk_stmt = f"ALTER TABLE {name}_new ADD PRIMARY KEY (tconst)"
+    index_stmts = [pk_stmt, *extra_indexes]
+    print(f"[DB] Building {len(index_stmts)} index statement(s) on {name}_new ...")
+    _run_indexes_parallel(index_stmts)
+
+    print(f"[DB] Swapping {name} ...")
+    with conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS {name}_old CASCADE")
+        cur.execute(f"ALTER TABLE IF EXISTS {name} RENAME TO {name}_old")
+        cur.execute(f"ALTER TABLE {name}_new RENAME TO {name}")
+        cur.execute(f"DROP TABLE IF EXISTS {name}_old CASCADE")
     conn.commit()
 
-
-def swap_tables(conn):
-    print("[DB] Swapping tables atomically ...")
-    with conn.cursor() as cur:
-        for name in ["titles", "episodes", "ratings"]:
-            cur.execute(f"DROP TABLE IF EXISTS {name}_old CASCADE")
-            cur.execute(f"ALTER TABLE IF EXISTS {name} RENAME TO {name}_old")
-            cur.execute(f"ALTER TABLE {name}_new RENAME TO {name}")
-    conn.commit()
-    print("[DB] Tables swapped.")
-
-
-def disable_txn_writes(conn):
-    """Skip Yugabyte's distributed-txn machinery for the staging COPYs.
-    Staging tables aren't visible to readers until swap_tables() renames them,
-    so per-row transactional guarantees buy nothing here."""
-    with conn.cursor() as cur:
-        cur.execute("SET yb_disable_transactional_writes = ON")
-    conn.commit()
+    print(f"[DB] === Phase {name} complete in {time.time() - phase_start:.0f}s ===")
 
 
 def run_full_load(conn, basics_tsv, episode_gz, ratings_gz):
-    create_staging_tables(conn)
-    disable_txn_writes(conn)
-    copy_from_tsv(conn, "titles_new", basics_tsv, ("tconst", "title_type", "primary_title", "start_year", "runtime_minutes", "genres"))
-    stream_gz_to_table(conn, "episodes_new", episode_gz, ("tconst", "parent_tconst", "season_number", "episode_number"))
-    stream_gz_to_table(conn, "ratings_new", ratings_gz, ("tconst", "average_rating", "num_votes"))
-    build_indexes(conn)
-    swap_tables(conn)
+    load_and_swap_one(
+        conn, "titles", TITLES_DDL, ("tsv", basics_tsv),
+        ("tconst", "title_type", "primary_title", "start_year", "runtime_minutes", "genres"),
+    )
+    load_and_swap_one(
+        conn, "episodes", EPISODES_DDL, ("gz", episode_gz),
+        ("tconst", "parent_tconst", "season_number", "episode_number"),
+        extra_indexes=("CREATE INDEX idx_episodes_parent ON episodes_new(parent_tconst)",),
+    )
+    load_and_swap_one(
+        conn, "ratings", RATINGS_DDL, ("gz", ratings_gz),
+        ("tconst", "average_rating", "num_votes"),
+    )
 
 
 def main():
@@ -426,7 +448,6 @@ def main():
                 subprocess.run(["sort", "-S", "256M", "-o", basics_tsv, basics_tsv], check=True)
                 print(f"[TRANSFORM] Sort complete in {time.time() - sort_start:.0f}s.")
                 run_full_load(conn, basics_tsv, paths["episode"], paths["ratings"])
-                drop_old_tables(conn)
 
             # Update stored hashes
             for key, (filename, state_name) in FILES.items():
