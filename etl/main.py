@@ -1,9 +1,11 @@
+import concurrent.futures
 import csv
 import gzip
 import hashlib
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -23,7 +25,7 @@ FILES = {
     "ratings": ("title.ratings.tsv.gz", "ratings"),
     "episode": ("title.episode.tsv.gz", "episode"),
 }
-KEEP_TYPES = {"tvEpisode", "tvSeries", "tvMiniSeries", "movie"}
+KEEP_TYPES = {"tvEpisode", "tvSeries", "tvMiniSeries"}
 
 
 def get_conn():
@@ -199,16 +201,24 @@ def stream_gz_to_table(conn, table, gz_path, columns):
     print(f"[DB] Stream COPY into {table} complete.")
 
 
+def _run_one(sql):
+    with get_conn() as c:
+        with c.cursor() as cur:
+            cur.execute(sql)
+        c.commit()
+
+
 def build_indexes(conn):
     print("[DB] Building indexes and primary keys ...")
-    with conn.cursor() as cur:
-        # Add PKs in bulk after load — much faster than per-row index maintenance during COPY
-        cur.execute("ALTER TABLE titles_new   ADD PRIMARY KEY (tconst)")
-        cur.execute("ALTER TABLE episodes_new ADD PRIMARY KEY (tconst)")
-        cur.execute("ALTER TABLE ratings_new  ADD PRIMARY KEY (tconst)")
-        cur.execute("CREATE INDEX idx_titles_type     ON titles_new(title_type)")
-        cur.execute("CREATE INDEX idx_episodes_parent ON episodes_new(parent_tconst)")
-    conn.commit()
+    statements = [
+        "ALTER TABLE titles_new   ADD PRIMARY KEY (tconst)",
+        "ALTER TABLE episodes_new ADD PRIMARY KEY (tconst)",
+        "ALTER TABLE ratings_new  ADD PRIMARY KEY (tconst)",
+        "CREATE INDEX idx_episodes_parent ON episodes_new(parent_tconst)",
+    ]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(statements)) as pool:
+        for fut in concurrent.futures.as_completed(pool.submit(_run_one, s) for s in statements):
+            fut.result()
     print("[DB] Indexes and primary keys built.")
 
 
@@ -223,8 +233,18 @@ def swap_tables(conn):
     print("[DB] Tables swapped.")
 
 
+def disable_txn_writes(conn):
+    """Skip Yugabyte's distributed-txn machinery for the staging COPYs.
+    Staging tables aren't visible to readers until swap_tables() renames them,
+    so per-row transactional guarantees buy nothing here."""
+    with conn.cursor() as cur:
+        cur.execute("SET yb_disable_transactional_writes = ON")
+    conn.commit()
+
+
 def run_full_load(conn, basics_tsv, episode_gz, ratings_gz):
     create_staging_tables(conn)
+    disable_txn_writes(conn)
     copy_from_tsv(conn, "titles_new", basics_tsv, ("tconst", "title_type", "primary_title", "start_year", "runtime_minutes", "genres"))
     stream_gz_to_table(conn, "episodes_new", episode_gz, ("tconst", "parent_tconst", "season_number", "episode_number"))
     stream_gz_to_table(conn, "ratings_new", ratings_gz, ("tconst", "average_rating", "num_votes"))
@@ -289,6 +309,7 @@ def main():
                         )
                     """)
                 conn.commit()
+                disable_txn_writes(conn)
                 stream_gz_to_table(conn, "ratings_new", paths["ratings"], ("tconst", "average_rating", "num_votes"))
                 with conn.cursor() as cur:
                     cur.execute("ALTER TABLE ratings_new ADD PRIMARY KEY (tconst)")
@@ -301,6 +322,10 @@ def main():
                 # Full rebuild path (first run OR basics/episode changed)
                 basics_tsv = os.path.join(tmpdir, "basics.tsv")
                 transform_basics(paths["basics"], basics_tsv)
+                # Sort by tconst so the deferred PK build does sequential B-tree inserts
+                # in DocDB instead of random ones. Runner-side, free CPU.
+                print("[TRANSFORM] Sorting basics.tsv by tconst ...")
+                subprocess.run(["sort", "-S", "256M", "-o", basics_tsv, basics_tsv], check=True)
                 run_full_load(conn, basics_tsv, paths["episode"], paths["ratings"])
 
             # Update stored hashes
