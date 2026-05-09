@@ -160,8 +160,8 @@ def create_staging_tables(conn):
             CREATE TABLE episodes_new (
                 tconst VARCHAR(10) NOT NULL,
                 parent_tconst VARCHAR(10) NOT NULL,
-                season_number SMALLINT,
-                episode_number SMALLINT
+                season_number INTEGER,
+                episode_number INTEGER
             )
         """)
         cur.execute("""
