@@ -8,10 +8,51 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import urllib.request
 import psycopg2
+
+
+class ProgressFile:
+    """File-like wrapper that prints bytes-read progress every `interval` seconds."""
+
+    def __init__(self, fileobj, label, total_bytes=None, interval=5.0):
+        self._f = fileobj
+        self._label = label
+        self._total = total_bytes
+        self._interval = interval
+        self._bytes = 0
+        self._start = time.time()
+        self._last_log = self._start
+
+    def _maybe_log(self):
+        now = time.time()
+        if now - self._last_log < self._interval:
+            return
+        mb = self._bytes / (1024 * 1024)
+        elapsed = now - self._start
+        rate = mb / elapsed if elapsed > 0 else 0
+        if self._total:
+            total_mb = self._total / (1024 * 1024)
+            pct = 100 * self._bytes / self._total
+            print(f"[PROGRESS] {self._label}: {mb:,.1f}/{total_mb:,.1f} MB ({pct:.0f}%, {rate:.1f} MB/s, {elapsed:.0f}s)")
+        else:
+            print(f"[PROGRESS] {self._label}: {mb:,.1f} MB read ({rate:.1f} MB/s, {elapsed:.0f}s)")
+        self._last_log = now
+
+    def read(self, size=-1):
+        chunk = self._f.read(size)
+        self._bytes += len(chunk)
+        self._maybe_log()
+        return chunk
+
+    def readline(self, size=-1):
+        line = self._f.readline(size) if size != -1 else self._f.readline()
+        self._bytes += len(line)
+        self._maybe_log()
+        return line
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -63,7 +104,24 @@ def download_file(filename):
     url = BASE_URL + filename
     local_path = os.path.join(tempfile.gettempdir(), filename)
     print(f"[DOWNLOAD] Starting {url} ...")
-    urllib.request.urlretrieve(url, local_path)
+    state = {"last": time.time(), "start": time.time()}
+
+    def hook(blocks, blocksize, total):
+        now = time.time()
+        if now - state["last"] < 3.0:
+            return
+        downloaded_mb = (blocks * blocksize) / (1024 * 1024)
+        elapsed = now - state["start"]
+        rate = downloaded_mb / elapsed if elapsed > 0 else 0
+        if total > 0:
+            total_mb = total / (1024 * 1024)
+            pct = 100 * blocks * blocksize / total
+            print(f"[DOWNLOAD]   {filename}: {downloaded_mb:.1f}/{total_mb:.1f} MB ({pct:.0f}%, {rate:.1f} MB/s)")
+        else:
+            print(f"[DOWNLOAD]   {filename}: {downloaded_mb:.1f} MB ({rate:.1f} MB/s)")
+        state["last"] = now
+
+    urllib.request.urlretrieve(url, local_path, reporthook=hook)
     size_mb = os.path.getsize(local_path) / (1024 * 1024)
     print(f"[DOWNLOAD] Saved {local_path} ({size_mb:.1f} MB)")
     return local_path
@@ -175,13 +233,16 @@ def create_staging_tables(conn):
 
 
 def copy_from_tsv(conn, table, path, columns):
-    print(f"[DB] Bulk copying into {table} ...")
+    total_bytes = os.path.getsize(path)
+    print(f"[DB] Bulk copying into {table} ({total_bytes / (1024*1024):.1f} MB) ...")
     cols = ", ".join(columns)
     sql = f"COPY {table} ({cols}) FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t')"
+    start = time.time()
     with conn.cursor() as cur, open(path, "r", encoding="utf-8") as f:
-        cur.copy_expert(sql, f)
+        wrapped = ProgressFile(f, f"COPY → {table}", total_bytes=total_bytes)
+        cur.copy_expert(sql, wrapped)
     conn.commit()
-    print(f"[DB] COPY into {table} complete.")
+    print(f"[DB] COPY into {table} complete in {time.time() - start:.0f}s.")
 
 
 def stream_gz_to_table(conn, table, gz_path, columns):
@@ -190,22 +251,28 @@ def stream_gz_to_table(conn, table, gz_path, columns):
     Safe for files whose values cannot contain tabs/newlines (IDs, numbers).
     IMDb uses \\N natively for NULLs, which matches PostgreSQL TEXT COPY format.
     """
-    print(f"[DB] Streaming {os.path.basename(gz_path)} → {table} ...")
+    compressed_bytes = os.path.getsize(gz_path)
+    print(f"[DB] Streaming {os.path.basename(gz_path)} ({compressed_bytes / (1024*1024):.1f} MB compressed) → {table} ...")
     cols = ", ".join(columns)
     sql = f"COPY {table} ({cols}) FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t')"
+    start = time.time()
     with gzip.open(gz_path, "rb") as gz_file:
         gz_file.readline()  # skip header row
+        wrapped = ProgressFile(gz_file, f"COPY → {table}")
         with conn.cursor() as cur:
-            cur.copy_expert(sql, gz_file)
+            cur.copy_expert(sql, wrapped)
     conn.commit()
-    print(f"[DB] Stream COPY into {table} complete.")
+    print(f"[DB] Stream COPY into {table} complete in {time.time() - start:.0f}s.")
 
 
 def _run_one(sql):
+    s_start = time.time()
+    print(f"[DB]   started: {sql}")
     with get_conn() as c:
         with c.cursor() as cur:
             cur.execute(sql)
         c.commit()
+    print(f"[DB]   finished in {time.time() - s_start:.0f}s: {sql}")
 
 
 def build_indexes(conn):
@@ -216,10 +283,33 @@ def build_indexes(conn):
         "ALTER TABLE ratings_new  ADD PRIMARY KEY (tconst)",
         "CREATE INDEX idx_episodes_parent ON episodes_new(parent_tconst)",
     ]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(statements)) as pool:
-        for fut in concurrent.futures.as_completed(pool.submit(_run_one, s) for s in statements):
-            fut.result()
-    print("[DB] Indexes and primary keys built.")
+    start = time.time()
+    completed = [0]
+    done = threading.Event()
+
+    def heartbeat():
+        while not done.wait(15):
+            print(f"[DB]   ... index build {time.time() - start:.0f}s elapsed, {completed[0]}/{len(statements)} done")
+
+    hb = threading.Thread(target=heartbeat, daemon=True)
+    hb.start()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(statements)) as pool:
+            futures = [pool.submit(_run_one, s) for s in statements]
+            for fut in concurrent.futures.as_completed(futures):
+                fut.result()
+                completed[0] += 1
+    finally:
+        done.set()
+    print(f"[DB] Indexes and primary keys built in {time.time() - start:.0f}s.")
+
+
+def drop_old_tables(conn):
+    print("[DB] Dropping prior *_old tables to free disk ...")
+    with conn.cursor() as cur:
+        for name in ["titles", "episodes", "ratings"]:
+            cur.execute(f"DROP TABLE IF EXISTS {name}_old CASCADE")
+    conn.commit()
 
 
 def swap_tables(conn):
@@ -263,6 +353,7 @@ def main():
     try:
         print("[DB] Ensuring state table exists ...")
         init_state_table(conn)
+        drop_old_tables(conn)
 
         tmpdir = tempfile.mkdtemp()
         try:
@@ -311,11 +402,17 @@ def main():
                 conn.commit()
                 disable_txn_writes(conn)
                 stream_gz_to_table(conn, "ratings_new", paths["ratings"], ("tconst", "average_rating", "num_votes"))
+                pk_start = time.time()
+                print("[DB] Adding primary key on ratings_new ...")
                 with conn.cursor() as cur:
                     cur.execute("ALTER TABLE ratings_new ADD PRIMARY KEY (tconst)")
+                print(f"[DB] Primary key added in {time.time() - pk_start:.0f}s.")
+                print("[DB] Swapping ratings tables ...")
+                with conn.cursor() as cur:
                     cur.execute("DROP TABLE IF EXISTS ratings_old CASCADE")
                     cur.execute("ALTER TABLE IF EXISTS ratings RENAME TO ratings_old")
                     cur.execute("ALTER TABLE ratings_new RENAME TO ratings")
+                    cur.execute("DROP TABLE IF EXISTS ratings_old CASCADE")
                 conn.commit()
                 print("[INCREMENTAL] Ratings swap complete.")
             else:
@@ -325,8 +422,11 @@ def main():
                 # Sort by tconst so the deferred PK build does sequential B-tree inserts
                 # in DocDB instead of random ones. Runner-side, free CPU.
                 print("[TRANSFORM] Sorting basics.tsv by tconst ...")
+                sort_start = time.time()
                 subprocess.run(["sort", "-S", "256M", "-o", basics_tsv, basics_tsv], check=True)
+                print(f"[TRANSFORM] Sort complete in {time.time() - sort_start:.0f}s.")
                 run_full_load(conn, basics_tsv, paths["episode"], paths["ratings"])
+                drop_old_tables(conn)
 
             # Update stored hashes
             for key, (filename, state_name) in FILES.items():
