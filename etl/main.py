@@ -337,6 +337,15 @@ def load_and_swap_one(conn, name, ddl, tsv_path, columns, extra_indexes=()):
 
     index_specs = list(extra_indexes)
     if index_specs:
+        # Drop the live secondary indexes before building the staging copies
+        # so the YB node isn't holding two full copies at once. Reads on the
+        # live table fall back to PK / seq scan for the duration of the build;
+        # the swap restores the index under its canonical name.
+        with conn.cursor() as cur:
+            for final, _ in index_specs:
+                cur.execute(f"DROP INDEX IF EXISTS {final}")
+        conn.commit()
+
         index_stmts = [
             f"CREATE INDEX {final}_new ON {name}_new ({col_expr})"
             for final, col_expr in index_specs
