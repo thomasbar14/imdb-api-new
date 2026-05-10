@@ -6,6 +6,10 @@ if (!DATABASE_URL) {
   throw new Error("DATABASE_URL is not set");
 }
 
+const DATABASE_CA_CERT = await Deno.readTextFile(
+  new URL("./yugabyte-ca.crt", import.meta.url),
+);
+
 const url = new URL(DATABASE_URL);
 const pool = new Pool(
   {
@@ -14,7 +18,11 @@ const pool = new Pool(
     database: url.pathname.slice(1).split("?")[0],
     user: decodeURIComponent(url.username),
     password: decodeURIComponent(url.password),
-    tls: { enabled: true, enforce: false },
+    tls: {
+      enabled: true,
+      enforce: true,
+      caCertificates: [DATABASE_CA_CERT],
+    },
   },
   10,
 );
