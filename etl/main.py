@@ -197,6 +197,9 @@ def init_state_table(conn):
     conn.commit()
 
 
+# PK is declared in the DDL so COPY writes directly into PK-organized
+# DocDB tablets. A post-load ADD PRIMARY KEY would rewrite the table
+# (peak disk ~2x), which Yugabyte rejects on a tight node.
 TITLES_DDL = """
     CREATE TABLE titles_new (
         tconst VARCHAR(10) NOT NULL,
@@ -204,7 +207,8 @@ TITLES_DDL = """
         primary_title TEXT NOT NULL,
         start_year SMALLINT,
         runtime_minutes INTEGER,
-        genres TEXT
+        genres TEXT,
+        PRIMARY KEY (tconst)
     )
 """
 
@@ -213,7 +217,8 @@ EPISODES_DDL = """
         tconst VARCHAR(10) NOT NULL,
         parent_tconst VARCHAR(10) NOT NULL,
         season_number INTEGER,
-        episode_number INTEGER
+        episode_number INTEGER,
+        PRIMARY KEY (tconst)
     )
 """
 
@@ -221,7 +226,8 @@ RATINGS_DDL = """
     CREATE TABLE ratings_new (
         tconst VARCHAR(10) NOT NULL,
         average_rating REAL NOT NULL,
-        num_votes INTEGER NOT NULL
+        num_votes INTEGER NOT NULL,
+        PRIMARY KEY (tconst)
     )
 """
 
@@ -239,24 +245,21 @@ def copy_from_tsv(conn, table, path, columns):
     print(f"[DB] COPY into {table} complete in {time.time() - start:.0f}s.")
 
 
-def stream_gz_to_table(conn, table, gz_path, columns):
-    """Stream a gzip TSV file directly to PostgreSQL COPY, skipping the header row.
+def gunzip_and_sort_by_tconst(gz_path, out_tsv):
+    """Decompress a gzipped IMDb TSV, drop the header, sort by tconst.
 
-    Safe for files whose values cannot contain tabs/newlines (IDs, numbers).
-    IMDb uses \\N natively for NULLs, which matches PostgreSQL TEXT COPY format.
+    Sorting runner-side lets COPY into a PK-organized table do sequential
+    DocDB inserts instead of random ones — much faster, and avoids any
+    in-database rewrite.
     """
-    compressed_bytes = os.path.getsize(gz_path)
-    print(f"[DB] Streaming {os.path.basename(gz_path)} ({compressed_bytes / (1024*1024):.1f} MB compressed) → {table} ...")
-    cols = ", ".join(columns)
-    sql = f"COPY {table} ({cols}) FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t')"
+    print(f"[TRANSFORM] Decompressing+sorting {os.path.basename(gz_path)} → {out_tsv} ...")
     start = time.time()
-    with gzip.open(gz_path, "rb") as gz_file:
-        gz_file.readline()  # skip header row
-        wrapped = ProgressFile(gz_file, f"COPY → {table}")
-        with conn.cursor() as cur:
-            cur.copy_expert(sql, wrapped)
-    conn.commit()
-    print(f"[DB] Stream COPY into {table} complete in {time.time() - start:.0f}s.")
+    with gzip.open(gz_path, "rb") as gz_in, open(out_tsv, "wb") as raw_out:
+        gz_in.readline()  # drop header
+        shutil.copyfileobj(gz_in, raw_out)
+    subprocess.run(["sort", "-k1,1", "-S", "256M", "-o", out_tsv, out_tsv], check=True)
+    size_mb = os.path.getsize(out_tsv) / (1024 * 1024)
+    print(f"[TRANSFORM] {os.path.basename(out_tsv)} ready ({size_mb:.1f} MB) in {time.time() - start:.0f}s.")
 
 
 def _run_one(sql):
@@ -309,11 +312,12 @@ def _run_indexes_serial(statements):
     print(f"[DB] Indexes built in {time.time() - start:.0f}s.")
 
 
-def load_and_swap_one(conn, name, ddl, source, columns, extra_indexes=()):
-    """Load → PK → extra indexes → swap → drop-old, all for one table.
+def load_and_swap_one(conn, name, ddl, tsv_path, columns, extra_indexes=()):
+    """Load → secondary indexes → swap → drop-old, all for one table.
 
-    Caps disk footprint at live{titles,episodes,ratings} + one staging table.
-    `source` is ("tsv", path) or ("gz", path).
+    The PK is declared in `ddl`, so COPY writes directly into PK-organized
+    storage and we skip a post-load table rewrite. `tsv_path` must be a
+    plain TSV sorted by tconst.
     """
     print(f"[DB] === Phase: {name} ===")
     phase_start = time.time()
@@ -324,18 +328,12 @@ def load_and_swap_one(conn, name, ddl, source, columns, extra_indexes=()):
     conn.commit()
     disable_txn_writes(conn)
 
-    kind, path = source
-    if kind == "tsv":
-        copy_from_tsv(conn, f"{name}_new", path, columns)
-    elif kind == "gz":
-        stream_gz_to_table(conn, f"{name}_new", path, columns)
-    else:
-        raise ValueError(f"unknown source kind: {kind}")
+    copy_from_tsv(conn, f"{name}_new", tsv_path, columns)
 
-    pk_stmt = f"ALTER TABLE {name}_new ADD PRIMARY KEY (tconst)"
-    index_stmts = [pk_stmt, *extra_indexes]
-    print(f"[DB] Building {len(index_stmts)} index statement(s) on {name}_new ...")
-    _run_indexes_serial(index_stmts)
+    index_stmts = list(extra_indexes)
+    if index_stmts:
+        print(f"[DB] Building {len(index_stmts)} secondary index statement(s) on {name}_new ...")
+        _run_indexes_serial(index_stmts)
 
     print(f"[DB] Swapping {name} ...")
     with conn.cursor() as cur:
@@ -348,20 +346,28 @@ def load_and_swap_one(conn, name, ddl, source, columns, extra_indexes=()):
     print(f"[DB] === Phase {name} complete in {time.time() - phase_start:.0f}s ===")
 
 
-def run_full_load(conn, basics_tsv, episode_gz, ratings_gz):
+def run_full_load(conn, tmpdir, basics_tsv, episode_gz, ratings_gz):
     load_and_swap_one(
-        conn, "titles", TITLES_DDL, ("tsv", basics_tsv),
+        conn, "titles", TITLES_DDL, basics_tsv,
         ("tconst", "title_type", "primary_title", "start_year", "runtime_minutes", "genres"),
     )
+
+    episode_tsv = os.path.join(tmpdir, "episode.sorted.tsv")
+    gunzip_and_sort_by_tconst(episode_gz, episode_tsv)
     load_and_swap_one(
-        conn, "episodes", EPISODES_DDL, ("gz", episode_gz),
+        conn, "episodes", EPISODES_DDL, episode_tsv,
         ("tconst", "parent_tconst", "season_number", "episode_number"),
         extra_indexes=("CREATE INDEX idx_episodes_parent ON episodes_new(parent_tconst)",),
     )
+    os.remove(episode_tsv)
+
+    ratings_tsv = os.path.join(tmpdir, "ratings.sorted.tsv")
+    gunzip_and_sort_by_tconst(ratings_gz, ratings_tsv)
     load_and_swap_one(
-        conn, "ratings", RATINGS_DDL, ("gz", ratings_gz),
+        conn, "ratings", RATINGS_DDL, ratings_tsv,
         ("tconst", "average_rating", "num_votes"),
     )
+    os.remove(ratings_tsv)
 
 
 def main():
@@ -412,42 +418,25 @@ def main():
 
             if only_ratings_changed:
                 print("[INCREMENTAL] Only ratings changed. Ratings staging swap ...")
-                with conn.cursor() as cur:
-                    cur.execute("DROP TABLE IF EXISTS ratings_new CASCADE")
-                    cur.execute("""
-                        CREATE TABLE ratings_new (
-                            tconst VARCHAR(10) NOT NULL,
-                            average_rating REAL NOT NULL,
-                            num_votes INTEGER NOT NULL
-                        )
-                    """)
-                conn.commit()
-                disable_txn_writes(conn)
-                stream_gz_to_table(conn, "ratings_new", paths["ratings"], ("tconst", "average_rating", "num_votes"))
-                pk_start = time.time()
-                print("[DB] Adding primary key on ratings_new ...")
-                with conn.cursor() as cur:
-                    cur.execute("ALTER TABLE ratings_new ADD PRIMARY KEY (tconst)")
-                print(f"[DB] Primary key added in {time.time() - pk_start:.0f}s.")
-                print("[DB] Swapping ratings tables ...")
-                with conn.cursor() as cur:
-                    cur.execute("DROP TABLE IF EXISTS ratings_old CASCADE")
-                    cur.execute("ALTER TABLE IF EXISTS ratings RENAME TO ratings_old")
-                    cur.execute("ALTER TABLE ratings_new RENAME TO ratings")
-                    cur.execute("DROP TABLE IF EXISTS ratings_old CASCADE")
-                conn.commit()
+                ratings_tsv = os.path.join(tmpdir, "ratings.sorted.tsv")
+                gunzip_and_sort_by_tconst(paths["ratings"], ratings_tsv)
+                load_and_swap_one(
+                    conn, "ratings", RATINGS_DDL, ratings_tsv,
+                    ("tconst", "average_rating", "num_votes"),
+                )
+                os.remove(ratings_tsv)
                 print("[INCREMENTAL] Ratings swap complete.")
             else:
                 # Full rebuild path (first run OR basics/episode changed)
                 basics_tsv = os.path.join(tmpdir, "basics.tsv")
                 transform_basics(paths["basics"], basics_tsv)
-                # Sort by tconst so the deferred PK build does sequential B-tree inserts
-                # in DocDB instead of random ones. Runner-side, free CPU.
+                # Sort by tconst so COPY into the PK-organized table does
+                # sequential DocDB inserts. Runner-side, free CPU.
                 print("[TRANSFORM] Sorting basics.tsv by tconst ...")
                 sort_start = time.time()
-                subprocess.run(["sort", "-S", "256M", "-o", basics_tsv, basics_tsv], check=True)
+                subprocess.run(["sort", "-k1,1", "-S", "256M", "-o", basics_tsv, basics_tsv], check=True)
                 print(f"[TRANSFORM] Sort complete in {time.time() - sort_start:.0f}s.")
-                run_full_load(conn, basics_tsv, paths["episode"], paths["ratings"])
+                run_full_load(conn, tmpdir, basics_tsv, paths["episode"], paths["ratings"])
 
             # Update stored hashes
             for key, (filename, state_name) in FILES.items():
