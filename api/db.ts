@@ -6,7 +6,18 @@ if (!DATABASE_URL) {
   throw new Error("DATABASE_URL is not set");
 }
 
-const pool = new Pool(DATABASE_URL, 10);
+const url = new URL(DATABASE_URL);
+const pool = new Pool(
+  {
+    hostname: url.hostname,
+    port: Number(url.port) || 5433,
+    database: url.pathname.slice(1).split("?")[0],
+    user: decodeURIComponent(url.username),
+    password: decodeURIComponent(url.password),
+    tls: { enabled: true, enforce: false },
+  },
+  10,
+);
 
 export async function query(sql: string, params?: unknown[]) {
   const client = await pool.connect();
