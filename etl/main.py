@@ -1,4 +1,3 @@
-import concurrent.futures
 import csv
 import gzip
 import hashlib
@@ -287,7 +286,10 @@ def disable_txn_writes(conn):
     conn.commit()
 
 
-def _run_indexes_parallel(statements):
+def _run_indexes_serial(statements):
+    # Yugabyte serializes online schema changes per table and aborts the
+    # loser of any concurrent DDL race with SerializationFailure
+    # ("schema version mismatch"). Run one DDL at a time per staging table.
     start = time.time()
     completed = [0]
     done = threading.Event()
@@ -299,11 +301,9 @@ def _run_indexes_parallel(statements):
     hb = threading.Thread(target=heartbeat, daemon=True)
     hb.start()
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(statements))) as pool:
-            futures = [pool.submit(_run_one, s) for s in statements]
-            for fut in concurrent.futures.as_completed(futures):
-                fut.result()
-                completed[0] += 1
+        for s in statements:
+            _run_one(s)
+            completed[0] += 1
     finally:
         done.set()
     print(f"[DB] Indexes built in {time.time() - start:.0f}s.")
@@ -335,7 +335,7 @@ def load_and_swap_one(conn, name, ddl, source, columns, extra_indexes=()):
     pk_stmt = f"ALTER TABLE {name}_new ADD PRIMARY KEY (tconst)"
     index_stmts = [pk_stmt, *extra_indexes]
     print(f"[DB] Building {len(index_stmts)} index statement(s) on {name}_new ...")
-    _run_indexes_parallel(index_stmts)
+    _run_indexes_serial(index_stmts)
 
     print(f"[DB] Swapping {name} ...")
     with conn.cursor() as cur:
