@@ -318,6 +318,11 @@ def load_and_swap_one(conn, name, ddl, tsv_path, columns, extra_indexes=()):
     The PK is declared in `ddl`, so COPY writes directly into PK-organized
     storage and we skip a post-load table rewrite. `tsv_path` must be a
     plain TSV sorted by tconst.
+
+    `extra_indexes` is a sequence of (final_index_name, column_expr) pairs.
+    Indexes are built on the staging table under `<final>_new` to avoid
+    colliding with the same-named index attached to the live table from a
+    prior run, then renamed to `<final>` atomically with the swap.
     """
     print(f"[DB] === Phase: {name} ===")
     phase_start = time.time()
@@ -330,8 +335,12 @@ def load_and_swap_one(conn, name, ddl, tsv_path, columns, extra_indexes=()):
 
     copy_from_tsv(conn, f"{name}_new", tsv_path, columns)
 
-    index_stmts = list(extra_indexes)
-    if index_stmts:
+    index_specs = list(extra_indexes)
+    if index_specs:
+        index_stmts = [
+            f"CREATE INDEX {final}_new ON {name}_new ({col_expr})"
+            for final, col_expr in index_specs
+        ]
         print(f"[DB] Building {len(index_stmts)} secondary index statement(s) on {name}_new ...")
         _run_indexes_serial(index_stmts)
 
@@ -341,6 +350,8 @@ def load_and_swap_one(conn, name, ddl, tsv_path, columns, extra_indexes=()):
         cur.execute(f"ALTER TABLE IF EXISTS {name} RENAME TO {name}_old")
         cur.execute(f"ALTER TABLE {name}_new RENAME TO {name}")
         cur.execute(f"DROP TABLE IF EXISTS {name}_old CASCADE")
+        for final, _ in index_specs:
+            cur.execute(f"ALTER INDEX {final}_new RENAME TO {final}")
     conn.commit()
 
     print(f"[DB] === Phase {name} complete in {time.time() - phase_start:.0f}s ===")
@@ -357,7 +368,7 @@ def run_full_load(conn, tmpdir, basics_tsv, episode_gz, ratings_gz):
     load_and_swap_one(
         conn, "episodes", EPISODES_DDL, episode_tsv,
         ("tconst", "parent_tconst", "season_number", "episode_number"),
-        extra_indexes=("CREATE INDEX idx_episodes_parent ON episodes_new(parent_tconst)",),
+        extra_indexes=(("idx_episodes_parent", "parent_tconst"),),
     )
     os.remove(episode_tsv)
 
