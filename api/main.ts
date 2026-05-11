@@ -80,7 +80,7 @@ const openApiSpec = {
   },
   servers: [
     { url: "http://localhost:8000", description: "Local dev" },
-    { url: "https://{host}", description: "Deno Deploy", variables: { host: { default: "imdb-api-new.deno.dev" } } },
+    { url: "https://imdb-api-new.thomasbar14.deno.net", description: "Deno Deploy" },
   ],
   components: {
     schemas: {
