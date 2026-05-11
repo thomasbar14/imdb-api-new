@@ -74,6 +74,11 @@ Zero-maintenance, completely free, auto-updating IMDb API served from the edge.
 
 All responses include `Cache-Control: public, max-age=3600` because the data only changes daily.
 
+Interactive docs are served by the API itself:
+
+- **`GET /docs`** — Swagger UI, try requests in-browser.
+- **`GET /openapi.json`** — OpenAPI 3.1 spec for client generation or schema validation.
+
 ### `GET /`
 Health check.
 

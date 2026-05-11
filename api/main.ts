@@ -22,6 +22,8 @@ app.get("/", (c) => {
       "GET /series/:tconst": "Get series metadata + all episodes grouped by season",
       "GET /series/:tconst/season/:season": "Get episodes for a specific season only",
       "GET /search?q=...": "Full-text search over titles (min 2 chars)",
+      "GET /openapi.json": "OpenAPI 3.1 specification",
+      "GET /docs": "Interactive Swagger UI",
     },
     example_tconsts: {
       "Game of Thrones (Series)": "tt0944947",
@@ -29,6 +31,221 @@ app.get("/", (c) => {
       "The Office (US)": "tt0386676",
     },
   });
+});
+
+const titleSchema = {
+  type: "object",
+  properties: {
+    tconst: { type: "string", example: "tt0944947" },
+    title_type: { type: "string", example: "tvSeries" },
+    primary_title: { type: "string", example: "Game of Thrones" },
+    start_year: { type: ["integer", "null"], example: 2011 },
+    runtime_minutes: { type: ["integer", "null"], example: 57 },
+    genres: { type: ["string", "null"], example: "Action,Adventure,Drama" },
+    average_rating: { type: ["number", "null"], example: 9.2 },
+    num_votes: { type: ["integer", "null"], example: 2150000 },
+  },
+  required: ["tconst", "title_type", "primary_title"],
+};
+
+const episodeSchema = {
+  type: "object",
+  properties: {
+    tconst: { type: "string", example: "tt1480055" },
+    season_number: { type: ["integer", "null"], example: 1 },
+    episode_number: { type: ["integer", "null"], example: 1 },
+    primary_title: { type: "string", example: "Winter Is Coming" },
+    start_year: { type: ["integer", "null"], example: 2011 },
+    runtime_minutes: { type: ["integer", "null"], example: 62 },
+    average_rating: { type: ["number", "null"], example: 9.1 },
+    num_votes: { type: ["integer", "null"], example: 50000 },
+  },
+  required: ["tconst", "primary_title"],
+};
+
+const errorSchema = {
+  type: "object",
+  properties: { error: { type: "string" } },
+  required: ["error"],
+};
+
+const openApiSpec = {
+  openapi: "3.1.0",
+  info: {
+    title: "IMDb Free API",
+    version: "1.0.0",
+    description:
+      "Zero-maintenance, completely free, auto-updating IMDb API. Data sourced from IMDb non-commercial datasets and refreshed daily. All successful responses include `Cache-Control: public, max-age=3600`.",
+    license: { name: "IMDb non-commercial datasets terms" },
+  },
+  servers: [
+    { url: "http://localhost:8000", description: "Local dev" },
+    { url: "https://{host}", description: "Deno Deploy", variables: { host: { default: "imdb-api-new.deno.dev" } } },
+  ],
+  components: {
+    schemas: {
+      Title: titleSchema,
+      Episode: episodeSchema,
+      SeriesWithSeasons: {
+        type: "object",
+        properties: {
+          series: { $ref: "#/components/schemas/Title" },
+          seasons: {
+            type: "object",
+            additionalProperties: {
+              type: "array",
+              items: { $ref: "#/components/schemas/Episode" },
+            },
+            description: "Episodes keyed by season number (or \"unknown\").",
+          },
+        },
+        required: ["series", "seasons"],
+      },
+      Error: errorSchema,
+    },
+    parameters: {
+      Tconst: {
+        name: "tconst",
+        in: "path",
+        required: true,
+        schema: { type: "string", pattern: "^tt[0-9]+$" },
+        example: "tt0944947",
+        description: "IMDb title identifier.",
+      },
+    },
+    responses: {
+      NotFound: {
+        description: "Resource not found",
+        content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+      },
+      BadRequest: {
+        description: "Invalid request",
+        content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+      },
+    },
+  },
+  paths: {
+    "/": {
+      get: {
+        summary: "Service index",
+        description: "Health check and endpoint listing.",
+        responses: {
+          "200": {
+            description: "Service metadata",
+            content: { "application/json": { schema: { type: "object" } } },
+          },
+        },
+      },
+    },
+    "/title/{tconst}": {
+      get: {
+        summary: "Get any title",
+        description: "Returns a movie, series, or episode with its rating.",
+        parameters: [{ $ref: "#/components/parameters/Tconst" }],
+        responses: {
+          "200": {
+            description: "Title found",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Title" } } },
+          },
+          "404": { $ref: "#/components/responses/NotFound" },
+        },
+      },
+    },
+    "/series/{tconst}": {
+      get: {
+        summary: "Get series with all episodes grouped by season",
+        parameters: [{ $ref: "#/components/parameters/Tconst" }],
+        responses: {
+          "200": {
+            description: "Series and its episodes",
+            content: {
+              "application/json": { schema: { $ref: "#/components/schemas/SeriesWithSeasons" } },
+            },
+          },
+          "404": { $ref: "#/components/responses/NotFound" },
+        },
+      },
+    },
+    "/series/{tconst}/season/{season}": {
+      get: {
+        summary: "Get episodes for a specific season",
+        parameters: [
+          { $ref: "#/components/parameters/Tconst" },
+          {
+            name: "season",
+            in: "path",
+            required: true,
+            schema: { type: "integer", minimum: 1 },
+            example: 1,
+          },
+        ],
+        responses: {
+          "200": {
+            description: "Episodes in season order (may be empty)",
+            content: {
+              "application/json": {
+                schema: { type: "array", items: { $ref: "#/components/schemas/Episode" } },
+              },
+            },
+          },
+          "400": { $ref: "#/components/responses/BadRequest" },
+        },
+      },
+    },
+    "/search": {
+      get: {
+        summary: "Search titles by name",
+        description:
+          "Case-insensitive substring match over `primary_title`. Returns up to 20 results sorted by vote count.",
+        parameters: [
+          {
+            name: "q",
+            in: "query",
+            required: true,
+            schema: { type: "string", minLength: 2 },
+            example: "game of thrones",
+          },
+        ],
+        responses: {
+          "200": {
+            description: "Matching titles",
+            content: {
+              "application/json": {
+                schema: { type: "array", items: { $ref: "#/components/schemas/Title" } },
+              },
+            },
+          },
+          "400": { $ref: "#/components/responses/BadRequest" },
+        },
+      },
+    },
+  },
+};
+
+app.get("/openapi.json", (c) => c.json(openApiSpec));
+
+app.get("/docs", (c) => {
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>IMDb Free API — Docs</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
+</head>
+<body>
+<div id="swagger-ui"></div>
+<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js" crossorigin></script>
+<script>
+  window.ui = SwaggerUIBundle({
+    url: "/openapi.json",
+    dom_id: "#swagger-ui",
+    deepLinking: true,
+  });
+</script>
+</body>
+</html>`;
+  return c.html(html);
 });
 
 app.get("/title/:tconst", async (c) => {
