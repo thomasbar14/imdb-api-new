@@ -231,6 +231,35 @@ RATINGS_DDL = """
     )
 """
 
+# Stage tables have no PK or indexes — scratch space for COPY, then SQL diff.
+TITLES_STAGE_DDL = """
+    CREATE TABLE titles_stage (
+        tconst VARCHAR(10) NOT NULL,
+        title_type VARCHAR(20) NOT NULL,
+        primary_title TEXT NOT NULL,
+        start_year SMALLINT,
+        runtime_minutes INTEGER,
+        genres TEXT
+    )
+"""
+
+EPISODES_STAGE_DDL = """
+    CREATE TABLE episodes_stage (
+        tconst VARCHAR(10) NOT NULL,
+        parent_tconst VARCHAR(10) NOT NULL,
+        season_number INTEGER,
+        episode_number INTEGER
+    )
+"""
+
+RATINGS_STAGE_DDL = """
+    CREATE TABLE ratings_stage (
+        tconst VARCHAR(10) NOT NULL,
+        average_rating REAL NOT NULL,
+        num_votes INTEGER NOT NULL
+    )
+"""
+
 
 def copy_from_tsv(conn, table, path, columns):
     total_bytes = os.path.getsize(path)
@@ -366,6 +395,112 @@ def load_and_swap_one(conn, name, ddl, tsv_path, columns, extra_indexes=()):
     print(f"[DB] === Phase {name} complete in {time.time() - phase_start:.0f}s ===")
 
 
+def load_and_diff_one(conn, name, stage_ddl, tsv_path, columns, update_cols, match_clause):
+    """Incremental update for one table via staging diff.
+
+    Loads the full new dataset into an unindexed stage table, then applies
+    only the actual changes (deletes + upserts) to the live table, leaving
+    its indexes intact and in-place throughout.
+    """
+    print(f"[DB] === Incremental diff: {name} ===")
+    phase_start = time.time()
+
+    with conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS {name}_stage CASCADE")
+        cur.execute(stage_ddl)
+    conn.commit()
+    disable_txn_writes(conn)
+    copy_from_tsv(conn, f"{name}_stage", tsv_path, columns)
+
+    # Re-enable transactional writes before touching the live table.
+    with conn.cursor() as cur:
+        cur.execute("SET yb_disable_transactional_writes = OFF")
+    conn.commit()
+
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            DELETE FROM {name}
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {name}_stage s WHERE s.tconst = {name}.tconst
+            )
+        """)
+        deleted = cur.rowcount
+    conn.commit()
+    print(f"[DB] Deleted {deleted:,} rows from {name}.")
+
+    col_list = ", ".join(columns)
+    set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            INSERT INTO {name} ({col_list})
+            SELECT {col_list} FROM {name}_stage
+            ON CONFLICT (tconst) DO UPDATE
+            SET {set_clause}
+            WHERE {match_clause}
+        """)
+        upserted = cur.rowcount
+    conn.commit()
+    print(f"[DB] Upserted {upserted:,} rows into {name} (inserts + actual changes).")
+
+    with conn.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS {name}_stage CASCADE")
+    conn.commit()
+
+    print(f"[DB] === Incremental diff {name} complete in {time.time() - phase_start:.0f}s ===")
+
+
+def run_incremental_load(conn, tmpdir, changed, paths):
+    if changed["basics"]:
+        basics_tsv = os.path.join(tmpdir, "basics.tsv")
+        transform_basics(paths["basics"], basics_tsv)
+        print("[TRANSFORM] Sorting basics.tsv by tconst ...")
+        sort_start = time.time()
+        subprocess.run(["sort", "-k1,1", "-S", "256M", "-o", basics_tsv, basics_tsv], check=True)
+        print(f"[TRANSFORM] Sort complete in {time.time() - sort_start:.0f}s.")
+        load_and_diff_one(
+            conn, "titles", TITLES_STAGE_DDL, basics_tsv,
+            columns=("tconst", "title_type", "primary_title", "start_year", "runtime_minutes", "genres"),
+            update_cols=("title_type", "primary_title", "start_year", "runtime_minutes", "genres"),
+            match_clause=(
+                "title_type IS DISTINCT FROM EXCLUDED.title_type OR "
+                "primary_title IS DISTINCT FROM EXCLUDED.primary_title OR "
+                "start_year IS DISTINCT FROM EXCLUDED.start_year OR "
+                "runtime_minutes IS DISTINCT FROM EXCLUDED.runtime_minutes OR "
+                "genres IS DISTINCT FROM EXCLUDED.genres"
+            ),
+        )
+        os.remove(basics_tsv)
+
+    if changed["episode"]:
+        episode_tsv = os.path.join(tmpdir, "episode.sorted.tsv")
+        gunzip_and_sort_by_tconst(paths["episode"], episode_tsv)
+        load_and_diff_one(
+            conn, "episodes", EPISODES_STAGE_DDL, episode_tsv,
+            columns=("tconst", "parent_tconst", "season_number", "episode_number"),
+            update_cols=("parent_tconst", "season_number", "episode_number"),
+            match_clause=(
+                "parent_tconst IS DISTINCT FROM EXCLUDED.parent_tconst OR "
+                "season_number IS DISTINCT FROM EXCLUDED.season_number OR "
+                "episode_number IS DISTINCT FROM EXCLUDED.episode_number"
+            ),
+        )
+        os.remove(episode_tsv)
+
+    if changed["ratings"]:
+        ratings_tsv = os.path.join(tmpdir, "ratings.sorted.tsv")
+        gunzip_and_sort_by_tconst(paths["ratings"], ratings_tsv)
+        load_and_diff_one(
+            conn, "ratings", RATINGS_STAGE_DDL, ratings_tsv,
+            columns=("tconst", "average_rating", "num_votes"),
+            update_cols=("average_rating", "num_votes"),
+            match_clause=(
+                "average_rating IS DISTINCT FROM EXCLUDED.average_rating OR "
+                "num_votes IS DISTINCT FROM EXCLUDED.num_votes"
+            ),
+        )
+        os.remove(ratings_tsv)
+
+
 def run_full_load(conn, tmpdir, basics_tsv, episode_gz, ratings_gz):
     load_and_swap_one(
         conn, "titles", TITLES_DDL, basics_tsv,
@@ -432,26 +567,12 @@ def main():
                 """)
                 has_live = cur.fetchone()[0]
 
-            # Full rebuild if any structural file changed;
-            # ratings-only staging swap if ONLY ratings changed.
-            only_ratings_changed = changed["ratings"] and not changed["basics"] and not changed["episode"] and has_live
-
-            if only_ratings_changed:
-                print("[INCREMENTAL] Only ratings changed. Ratings staging swap ...")
-                ratings_tsv = os.path.join(tmpdir, "ratings.sorted.tsv")
-                gunzip_and_sort_by_tconst(paths["ratings"], ratings_tsv)
-                load_and_swap_one(
-                    conn, "ratings", RATINGS_DDL, ratings_tsv,
-                    ("tconst", "average_rating", "num_votes"),
-                )
-                os.remove(ratings_tsv)
-                print("[INCREMENTAL] Ratings swap complete.")
+            if has_live:
+                run_incremental_load(conn, tmpdir, changed, paths)
             else:
-                # Full rebuild path (first run OR basics/episode changed)
+                # First run — no live tables yet; COPY+swap is fastest.
                 basics_tsv = os.path.join(tmpdir, "basics.tsv")
                 transform_basics(paths["basics"], basics_tsv)
-                # Sort by tconst so COPY into the PK-organized table does
-                # sequential DocDB inserts. Runner-side, free CPU.
                 print("[TRANSFORM] Sorting basics.tsv by tconst ...")
                 sort_start = time.time()
                 subprocess.run(["sort", "-k1,1", "-S", "256M", "-o", basics_tsv, basics_tsv], check=True)
