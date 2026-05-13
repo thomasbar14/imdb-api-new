@@ -24,7 +24,8 @@ const pool = new Pool(
       caCertificates: [DATABASE_CA_CERT],
     },
   },
-  10,
+  2,
+  true,
 );
 
 export async function query(sql: string, params?: unknown[]) {
