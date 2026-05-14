@@ -418,6 +418,16 @@ def load_and_diff_one(conn, name, stage_ddl, tsv_path, columns, update_cols):
     disable_txn_writes(conn)
     copy_from_tsv(conn, f"{name}_stage", tsv_path, columns)
 
+    # Index stage.tconst so the anti-join DELETE and the per-batch upsert
+    # use nested-loop lookups instead of a full-stage hash that spills past
+    # YugabyteDB's temp_file_limit on 8M+ row tables.
+    print(f"[DB] Building tconst index on {name}_stage ...")
+    idx_start = time.time()
+    with conn.cursor() as cur:
+        cur.execute(f"CREATE INDEX ON {name}_stage (tconst)")
+    conn.commit()
+    print(f"[DB]   ... index built in {time.time() - idx_start:.0f}s.")
+
     # Re-enable transactional writes before touching the live table.
     with conn.cursor() as cur:
         cur.execute("SET yb_disable_transactional_writes = OFF")
