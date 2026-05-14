@@ -395,7 +395,7 @@ def load_and_swap_one(conn, name, ddl, tsv_path, columns, extra_indexes=()):
     print(f"[DB] === Phase {name} complete in {time.time() - phase_start:.0f}s ===")
 
 
-def load_and_diff_one(conn, name, stage_ddl, tsv_path, columns, update_cols, match_clause):
+def load_and_diff_one(conn, name, stage_ddl, tsv_path, columns, update_cols):
     """Incremental update for one table via staging diff.
 
     Loads the full new dataset into an unindexed stage table, then applies
@@ -430,13 +430,16 @@ def load_and_diff_one(conn, name, stage_ddl, tsv_path, columns, update_cols, mat
 
     col_list = ", ".join(columns)
     set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
+    # Qualify existing-row columns with the table name to avoid ambiguity
+    # in ON CONFLICT DO UPDATE WHERE (required by YugabyteDB).
+    where_clause = " OR ".join(f"{name}.{c} IS DISTINCT FROM EXCLUDED.{c}" for c in update_cols)
     with conn.cursor() as cur:
         cur.execute(f"""
             INSERT INTO {name} ({col_list})
             SELECT {col_list} FROM {name}_stage
             ON CONFLICT (tconst) DO UPDATE
             SET {set_clause}
-            WHERE {match_clause}
+            WHERE {where_clause}
         """)
         upserted = cur.rowcount
     conn.commit()
@@ -461,13 +464,6 @@ def run_incremental_load(conn, tmpdir, changed, paths):
             conn, "titles", TITLES_STAGE_DDL, basics_tsv,
             columns=("tconst", "title_type", "primary_title", "start_year", "runtime_minutes", "genres"),
             update_cols=("title_type", "primary_title", "start_year", "runtime_minutes", "genres"),
-            match_clause=(
-                "title_type IS DISTINCT FROM EXCLUDED.title_type OR "
-                "primary_title IS DISTINCT FROM EXCLUDED.primary_title OR "
-                "start_year IS DISTINCT FROM EXCLUDED.start_year OR "
-                "runtime_minutes IS DISTINCT FROM EXCLUDED.runtime_minutes OR "
-                "genres IS DISTINCT FROM EXCLUDED.genres"
-            ),
         )
         os.remove(basics_tsv)
 
@@ -478,11 +474,6 @@ def run_incremental_load(conn, tmpdir, changed, paths):
             conn, "episodes", EPISODES_STAGE_DDL, episode_tsv,
             columns=("tconst", "parent_tconst", "season_number", "episode_number"),
             update_cols=("parent_tconst", "season_number", "episode_number"),
-            match_clause=(
-                "parent_tconst IS DISTINCT FROM EXCLUDED.parent_tconst OR "
-                "season_number IS DISTINCT FROM EXCLUDED.season_number OR "
-                "episode_number IS DISTINCT FROM EXCLUDED.episode_number"
-            ),
         )
         os.remove(episode_tsv)
 
@@ -493,10 +484,6 @@ def run_incremental_load(conn, tmpdir, changed, paths):
             conn, "ratings", RATINGS_STAGE_DDL, ratings_tsv,
             columns=("tconst", "average_rating", "num_votes"),
             update_cols=("average_rating", "num_votes"),
-            match_clause=(
-                "average_rating IS DISTINCT FROM EXCLUDED.average_rating OR "
-                "num_votes IS DISTINCT FROM EXCLUDED.num_votes"
-            ),
         )
         os.remove(ratings_tsv)
 
