@@ -1,6 +1,7 @@
 import csv
 import gzip
 import hashlib
+import io
 import logging
 import os
 import shutil
@@ -266,6 +267,13 @@ RATINGS_STAGE_DDL = """
 
 UPSERT_BATCH = 25_000
 
+# Rows per chunk in the chunked stage-and-diff loop. Each chunk is COPYed
+# into a freshly TRUNCATEd stage table, so the peak on-disk staging
+# footprint is bounded by this constant regardless of total dataset size.
+# Sized to keep the per-chunk stage hash for the DELETE anti-join inside
+# work_mem (no spill) and well under YugabyteDB's tablet disk headroom.
+STAGE_CHUNK_ROWS = 1_000_000
+
 
 def copy_from_tsv(conn, table, path, columns):
     total_bytes = os.path.getsize(path)
@@ -402,11 +410,18 @@ def load_and_swap_one(conn, name, ddl, tsv_path, columns, extra_indexes=()):
 
 
 def load_and_diff_one(conn, name, stage_ddl, tsv_path, columns, update_cols):
-    """Incremental update for one table via staging diff.
+    """Incremental update for one table via chunked staging diff.
 
-    Loads the full new dataset into an unindexed stage table, then applies
-    only the actual changes (deletes + upserts) to the live table, leaving
-    its indexes intact and in-place throughout.
+    The sorted TSV is read in fixed-size row chunks. For each chunk we
+    TRUNCATE the stage, COPY just that chunk, then reconcile only the
+    matching tconst range of the live table (DELETE missing + UPSERT
+    changed). Peak on-disk stage footprint stays at ~STAGE_CHUNK_ROWS
+    regardless of dataset size — required because the full stage table
+    pushed the YB tablet past its disk quota mid-COPY on titles.
+
+    Correctness relies on the input being tconst-sorted: chunk tconst
+    ranges are disjoint and contiguous, so a per-chunk DELETE bounded
+    by [min_t, max_t] is equivalent to one full-table anti-join.
     """
     print(f"[DB] === Incremental diff: {name} ===")
     phase_start = time.time()
@@ -415,69 +430,88 @@ def load_and_diff_one(conn, name, stage_ddl, tsv_path, columns, update_cols):
         cur.execute(f"DROP TABLE IF EXISTS {name}_stage CASCADE")
         cur.execute(stage_ddl)
     conn.commit()
-    disable_txn_writes(conn)
-    copy_from_tsv(conn, f"{name}_stage", tsv_path, columns)
-
-    # Index stage.tconst so the anti-join DELETE and the per-batch upsert
-    # use nested-loop lookups instead of a full-stage hash that spills past
-    # YugabyteDB's temp_file_limit on 8M+ row tables.
-    print(f"[DB] Building tconst index on {name}_stage ...")
-    idx_start = time.time()
-    with conn.cursor() as cur:
-        cur.execute(f"CREATE INDEX ON {name}_stage (tconst)")
-    conn.commit()
-    print(f"[DB]   ... index built in {time.time() - idx_start:.0f}s.")
-
-    # Re-enable transactional writes before touching the live table.
-    with conn.cursor() as cur:
-        cur.execute("SET yb_disable_transactional_writes = OFF")
-    conn.commit()
-
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            DELETE FROM {name}
-            WHERE NOT EXISTS (
-                SELECT 1 FROM {name}_stage s WHERE s.tconst = {name}.tconst
-            )
-        """)
-        deleted = cur.rowcount
-    conn.commit()
-    print(f"[DB] Deleted {deleted:,} rows from {name}.")
 
     col_list = ", ".join(columns)
     set_clause = ", ".join(f"{c} = EXCLUDED.{c}" for c in update_cols)
     # Qualify existing-row columns with the table name to avoid ambiguity
     # in ON CONFLICT DO UPDATE WHERE (required by YugabyteDB).
     where_clause = " OR ".join(f"{name}.{c} IS DISTINCT FROM EXCLUDED.{c}" for c in update_cols)
+    copy_sql = f"COPY {name}_stage ({col_list}) FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t')"
 
-    # Batched upsert via row_num ranges to keep individual transactions small.
-    with conn.cursor() as cur:
-        cur.execute(f"SELECT MAX(row_num) FROM {name}_stage")
-        max_row = cur.fetchone()[0] or 0
+    total_deleted = 0
+    total_upserted = 0
+    chunk_idx = 0
 
-    last_row = 0
-    upserted = 0
-    batch_num = 0
-    while last_row < max_row:
-        batch_end = last_row + UPSERT_BATCH
-        with conn.cursor() as cur:
-            cur.execute(f"""
-                INSERT INTO {name} ({col_list})
-                SELECT {col_list} FROM {name}_stage
-                WHERE row_num > %s AND row_num <= %s
-                ON CONFLICT (tconst) DO UPDATE
-                SET {set_clause}
-                WHERE {where_clause}
-            """, (last_row, batch_end))
-            upserted += max(cur.rowcount, 0)
-        conn.commit()
-        last_row = batch_end
-        batch_num += 1
-        if batch_num % 20 == 0:
-            pct = 100 * last_row / max_row
-            print(f"[DB] Upsert {name}: {last_row:,}/{max_row:,} rows ({pct:.0f}%) ...")
+    with open(tsv_path, "r", encoding="utf-8") as f:
+        while True:
+            lines = []
+            for _ in range(STAGE_CHUNK_ROWS):
+                line = f.readline()
+                if not line:
+                    break
+                lines.append(line)
+            if not lines:
+                break
 
-    print(f"[DB] Upserted {upserted:,} rows into {name} (inserts + actual changes).")
+            chunk_idx += 1
+            chunk_rows = len(lines)
+            min_t = lines[0].split("\t", 1)[0]
+            max_t = lines[-1].split("\t", 1)[0]
+            chunk_start = time.time()
+
+            # Reset stage. RESTART IDENTITY so row_num starts at 1 each
+            # chunk, letting the upsert pagination use a fixed [0..chunk_rows]
+            # range instead of tracking a global offset.
+            with conn.cursor() as cur:
+                cur.execute(f"TRUNCATE {name}_stage RESTART IDENTITY")
+                cur.execute("SET yb_disable_transactional_writes = ON")
+            conn.commit()
+
+            with conn.cursor() as cur:
+                cur.copy_expert(copy_sql, io.StringIO("".join(lines)))
+            conn.commit()
+
+            with conn.cursor() as cur:
+                cur.execute("SET yb_disable_transactional_writes = OFF")
+                cur.execute(f"""
+                    DELETE FROM {name}
+                    WHERE tconst BETWEEN %s AND %s
+                      AND NOT EXISTS (
+                        SELECT 1 FROM {name}_stage s WHERE s.tconst = {name}.tconst
+                      )
+                """, (min_t, max_t))
+                deleted = cur.rowcount
+            conn.commit()
+            total_deleted += deleted
+
+            last_row = 0
+            chunk_upserted = 0
+            while last_row < chunk_rows:
+                batch_end = last_row + UPSERT_BATCH
+                with conn.cursor() as cur:
+                    cur.execute(f"""
+                        INSERT INTO {name} ({col_list})
+                        SELECT {col_list} FROM {name}_stage
+                        WHERE row_num > %s AND row_num <= %s
+                        ON CONFLICT (tconst) DO UPDATE
+                        SET {set_clause}
+                        WHERE {where_clause}
+                    """, (last_row, batch_end))
+                    chunk_upserted += max(cur.rowcount, 0)
+                conn.commit()
+                last_row = batch_end
+            total_upserted += chunk_upserted
+
+            print(
+                f"[DB] Chunk {chunk_idx} [{min_t}..{max_t}] "
+                f"{chunk_rows:,} rows: deleted {deleted:,}, upserted {chunk_upserted:,} "
+                f"in {time.time() - chunk_start:.0f}s"
+            )
+
+    print(
+        f"[DB] {name}: {total_deleted:,} deleted, {total_upserted:,} upserted "
+        f"across {chunk_idx} chunks"
+    )
 
     with conn.cursor() as cur:
         cur.execute(f"DROP TABLE IF EXISTS {name}_stage CASCADE")
