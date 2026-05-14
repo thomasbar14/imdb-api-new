@@ -231,9 +231,11 @@ RATINGS_DDL = """
     )
 """
 
-# Stage tables have no PK or indexes — scratch space for COPY, then SQL diff.
+# Stage tables get a BIGSERIAL for cheap keyset-paginated batched upserts.
+# row_num is excluded from the COPY column list so it auto-populates.
 TITLES_STAGE_DDL = """
     CREATE TABLE titles_stage (
+        row_num BIGSERIAL,
         tconst VARCHAR(10) NOT NULL,
         title_type VARCHAR(20) NOT NULL,
         primary_title TEXT NOT NULL,
@@ -245,6 +247,7 @@ TITLES_STAGE_DDL = """
 
 EPISODES_STAGE_DDL = """
     CREATE TABLE episodes_stage (
+        row_num BIGSERIAL,
         tconst VARCHAR(10) NOT NULL,
         parent_tconst VARCHAR(10) NOT NULL,
         season_number INTEGER,
@@ -254,11 +257,14 @@ EPISODES_STAGE_DDL = """
 
 RATINGS_STAGE_DDL = """
     CREATE TABLE ratings_stage (
+        row_num BIGSERIAL,
         tconst VARCHAR(10) NOT NULL,
         average_rating REAL NOT NULL,
         num_votes INTEGER NOT NULL
     )
 """
+
+UPSERT_BATCH = 25_000
 
 
 def copy_from_tsv(conn, table, path, columns):
@@ -433,16 +439,34 @@ def load_and_diff_one(conn, name, stage_ddl, tsv_path, columns, update_cols):
     # Qualify existing-row columns with the table name to avoid ambiguity
     # in ON CONFLICT DO UPDATE WHERE (required by YugabyteDB).
     where_clause = " OR ".join(f"{name}.{c} IS DISTINCT FROM EXCLUDED.{c}" for c in update_cols)
+
+    # Batched upsert via row_num ranges to keep individual transactions small.
     with conn.cursor() as cur:
-        cur.execute(f"""
-            INSERT INTO {name} ({col_list})
-            SELECT {col_list} FROM {name}_stage
-            ON CONFLICT (tconst) DO UPDATE
-            SET {set_clause}
-            WHERE {where_clause}
-        """)
-        upserted = cur.rowcount
-    conn.commit()
+        cur.execute(f"SELECT MAX(row_num) FROM {name}_stage")
+        max_row = cur.fetchone()[0] or 0
+
+    last_row = 0
+    upserted = 0
+    batch_num = 0
+    while last_row < max_row:
+        batch_end = last_row + UPSERT_BATCH
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                INSERT INTO {name} ({col_list})
+                SELECT {col_list} FROM {name}_stage
+                WHERE row_num > %s AND row_num <= %s
+                ON CONFLICT (tconst) DO UPDATE
+                SET {set_clause}
+                WHERE {where_clause}
+            """, (last_row, batch_end))
+            upserted += max(cur.rowcount, 0)
+        conn.commit()
+        last_row = batch_end
+        batch_num += 1
+        if batch_num % 20 == 0:
+            pct = 100 * last_row / max_row
+            print(f"[DB] Upsert {name}: {last_row:,}/{max_row:,} rows ({pct:.0f}%) ...")
+
     print(f"[DB] Upserted {upserted:,} rows into {name} (inserts + actual changes).")
 
     with conn.cursor() as cur:
