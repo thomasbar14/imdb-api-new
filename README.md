@@ -201,7 +201,7 @@ Increase `timeout-minutes` in `.github/workflows/etl.yml` (default is 120). The 
 Make sure your YugabyteDB cluster allows connections from your Deno Deploy project's egress IPs. In YugabyteDB **Network Access**, add `0.0.0.0/0` temporarily to test, then restrict to Deno Deploy's ranges if desired.
 
 ### Search is slow
-Search uses `ILIKE` (substring match) without a GIN index. This is a trade-off for faster ETL builds. If you need faster search, you can add `CREATE INDEX idx_titles_search ON titles USING gin(to_tsvector('english', primary_title));` manually after the initial load.
+Search uses `ILIKE` (substring match), accelerated by a `pg_trgm` GIN index (`idx_titles_title_trgm`). Fresh loads create it automatically; for an existing database apply `migrations/001_api_read_indexes.sql` once.
 
 ### Storage grows over time
 The dataset grows slowly. If you ever approach the 10 GB limit, edit `etl/main.py` and remove `"movie"` from `KEEP_TYPES` to save ~1 GB.

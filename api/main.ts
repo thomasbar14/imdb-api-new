@@ -6,11 +6,33 @@ const app = new Hono();
 
 app.use("*", cors());
 
+// Data only changes once a day, so serve repeat GETs from the Cache API
+// instead of making an edge→DB round trip. Degrades to no caching if the
+// Cache API is unavailable. Entries expire per their Cache-Control header.
+const responseCache: Promise<Cache | null> = typeof caches === "undefined"
+  ? Promise.resolve(null)
+  : caches.open("api-v1").catch(() => null);
+
 app.use("*", async (c, next) => {
+  if (c.req.method !== "GET") return next();
+
+  const cache = await responseCache;
+  const hit = await cache?.match(c.req.raw).catch(() => undefined);
+  if (hit) return new Response(hit.body, hit);
+
   await next();
+
   if (c.res.status === 200) {
-    c.res.headers.set("Cache-Control", "public, max-age=3600");
+    c.res.headers.set(
+      "Cache-Control",
+      "public, max-age=3600, s-maxage=3600, stale-while-revalidate=86400",
+    );
+  } else if (c.res.status === 404) {
+    c.res.headers.set("Cache-Control", "public, max-age=300");
+  } else {
+    return;
   }
+  cache?.put(c.req.raw, c.res.clone()).catch(() => {});
 });
 
 app.get("/", (c) => {
@@ -266,9 +288,23 @@ app.get("/title/:tconst", async (c) => {
 
 app.get("/series/:tconst", async (c) => {
   const tconst = c.req.param("tconst");
+  // Series row and its episodes in one round trip: episodes are aggregated
+  // into a JSON array so the edge only waits on the DB once.
   const seriesRows = await query(
     `SELECT t.tconst, t.title_type, t.primary_title, t.start_year, t.runtime_minutes, t.genres,
-            r.average_rating, r.num_votes
+            r.average_rating, r.num_votes,
+            COALESCE((
+              SELECT json_agg(ep ORDER BY ep.season_number NULLS LAST, ep.episode_number NULLS LAST)
+              FROM (
+                SELECT e.tconst, e.season_number, e.episode_number,
+                       et.primary_title, et.start_year, et.runtime_minutes,
+                       er.average_rating, er.num_votes
+                FROM episodes e
+                JOIN titles et ON e.tconst = et.tconst
+                LEFT JOIN ratings er ON e.tconst = er.tconst
+                WHERE e.parent_tconst = $1
+              ) ep
+            ), '[]'::json) AS episodes
      FROM titles t
      LEFT JOIN ratings r ON t.tconst = r.tconst
      WHERE t.tconst = $1 AND t.title_type IN ('tvSeries', 'tvMiniSeries')`,
@@ -278,27 +314,16 @@ app.get("/series/:tconst", async (c) => {
     return c.json({ error: "Series not found" }, 404);
   }
 
-  const episodes = await query(
-    `SELECT e.tconst, e.season_number, e.episode_number,
-            t.primary_title, t.start_year, t.runtime_minutes,
-            r.average_rating, r.num_votes
-     FROM episodes e
-     JOIN titles t ON e.tconst = t.tconst
-     LEFT JOIN ratings r ON e.tconst = r.tconst
-     WHERE e.parent_tconst = $1
-     ORDER BY e.season_number NULLS LAST, e.episode_number NULLS LAST`,
-    [tconst],
-  );
-
+  const { episodes, ...series } = seriesRows[0];
   const seasons: Record<string, Record<string, unknown>[]> = {};
-  for (const ep of episodes) {
-    const s = ep.season_number ?? "unknown";
+  for (const ep of episodes as Record<string, unknown>[]) {
+    const s = String(ep.season_number ?? "unknown");
     if (!seasons[s]) seasons[s] = [];
     seasons[s].push(ep);
   }
 
   return c.json({
-    series: seriesRows[0],
+    series,
     seasons,
   });
 });

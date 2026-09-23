@@ -362,7 +362,9 @@ def load_and_swap_one(conn, name, ddl, tsv_path, columns, extra_indexes=()):
     storage and we skip a post-load table rewrite. `tsv_path` must be a
     plain TSV sorted by tconst.
 
-    `extra_indexes` is a sequence of (final_index_name, column_expr) pairs.
+    `extra_indexes` is a sequence of (final_index_name, index_spec) pairs,
+    where index_spec is everything after `ON <table>` (e.g. "(col ASC)" or
+    "USING ybgin (col gin_trgm_ops)").
     Indexes are built on the staging table under `<final>_new` to avoid
     colliding with the same-named index attached to the live table from a
     prior run, then renamed to `<final>` atomically with the swap.
@@ -390,8 +392,8 @@ def load_and_swap_one(conn, name, ddl, tsv_path, columns, extra_indexes=()):
         conn.commit()
 
         index_stmts = [
-            f"CREATE INDEX {final}_new ON {name}_new ({col_expr})"
-            for final, col_expr in index_specs
+            f"CREATE INDEX {final}_new ON {name}_new {spec}"
+            for final, spec in index_specs
         ]
         print(f"[DB] Building {len(index_stmts)} secondary index statement(s) on {name}_new ...")
         _run_indexes_serial(index_stmts)
@@ -557,17 +559,29 @@ def run_incremental_load(conn, tmpdir, changed, paths):
 
 
 def run_full_load(conn, tmpdir, basics_tsv, episode_gz, ratings_gz):
+    with conn.cursor() as cur:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+    conn.commit()
+
+    # Trigram index lets /search's ILIKE '%q%' avoid a full titles scan.
     load_and_swap_one(
         conn, "titles", TITLES_DDL, basics_tsv,
         ("tconst", "title_type", "primary_title", "start_year", "runtime_minutes", "genres"),
+        extra_indexes=(("idx_titles_title_trgm", "USING ybgin (primary_title gin_trgm_ops)"),),
     )
 
     episode_tsv = os.path.join(tmpdir, "episode.sorted.tsv")
     gunzip_and_sort_by_tconst(episode_gz, episode_tsv)
+    # Season/episode columns in the key let /series read episodes already
+    # ordered and serve the per-season filter from the index. The base PK
+    # (tconst) is carried in every YB secondary index implicitly.
     load_and_swap_one(
         conn, "episodes", EPISODES_DDL, episode_tsv,
         ("tconst", "parent_tconst", "season_number", "episode_number"),
-        extra_indexes=(("idx_episodes_parent", "parent_tconst"),),
+        extra_indexes=((
+            "idx_episodes_parent",
+            "(parent_tconst HASH, season_number ASC, episode_number ASC)",
+        ),),
     )
     os.remove(episode_tsv)
 

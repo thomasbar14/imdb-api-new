@@ -1,6 +1,8 @@
 -- Optimized schema (ETL script creates and manages tables automatically)
 -- No SERIAL id columns — tconst is the natural primary key.
--- No heavy GIN index on staging rebuilds; search uses ILIKE for simplicity.
+-- Search uses ILIKE, accelerated by a pg_trgm GIN index.
+
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 CREATE TABLE IF NOT EXISTS titles (
     tconst VARCHAR(10) PRIMARY KEY,
@@ -25,4 +27,7 @@ CREATE TABLE IF NOT EXISTS ratings (
 );
 
 CREATE INDEX IF NOT EXISTS idx_titles_type ON titles(title_type);
-CREATE INDEX IF NOT EXISTS idx_episodes_parent ON episodes(parent_tconst);
+CREATE INDEX IF NOT EXISTS idx_episodes_parent
+    ON episodes (parent_tconst HASH, season_number ASC, episode_number ASC);
+CREATE INDEX IF NOT EXISTS idx_titles_title_trgm
+    ON titles USING ybgin (primary_title gin_trgm_ops);
