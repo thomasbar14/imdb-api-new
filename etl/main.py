@@ -201,6 +201,10 @@ def init_state_table(conn):
 # PK is declared in the DDL so COPY writes directly into PK-organized
 # DocDB tablets. A post-load ADD PRIMARY KEY would rewrite the table
 # (peak disk ~2x), which Yugabyte rejects on a tight node.
+#
+# PKs are range-sharded (ASC), not YB's default HASH: inputs arrive
+# tconst-sorted so COPY writes sequentially, and the incremental diff's
+# `tconst BETWEEN` chunk DELETE becomes a range scan instead of a full scan.
 TITLES_DDL = """
     CREATE TABLE titles_new (
         tconst VARCHAR(10) NOT NULL,
@@ -209,7 +213,7 @@ TITLES_DDL = """
         start_year SMALLINT,
         runtime_minutes INTEGER,
         genres TEXT,
-        PRIMARY KEY (tconst)
+        PRIMARY KEY (tconst ASC)
     )
 """
 
@@ -219,7 +223,7 @@ EPISODES_DDL = """
         parent_tconst VARCHAR(10) NOT NULL,
         season_number INTEGER,
         episode_number INTEGER,
-        PRIMARY KEY (tconst)
+        PRIMARY KEY (tconst ASC)
     )
 """
 
@@ -228,40 +232,45 @@ RATINGS_DDL = """
         tconst VARCHAR(10) NOT NULL,
         average_rating REAL NOT NULL,
         num_votes INTEGER NOT NULL,
-        PRIMARY KEY (tconst)
+        PRIMARY KEY (tconst ASC)
     )
 """
 
-# Stage tables get a BIGSERIAL for cheap keyset-paginated batched upserts.
-# row_num is excluded from the COPY column list so it auto-populates.
+# Stage tables are keyed on a range-sharded row_num for keyset-paginated
+# batched upserts. row_num is written client-side into the COPY stream (no
+# SERIAL: YB sequences cost a master RPC per cache refill), and the ASC PK
+# makes each `row_num` batch a range scan rather than a full stage scan.
 TITLES_STAGE_DDL = """
     CREATE TABLE titles_stage (
-        row_num BIGSERIAL,
+        row_num BIGINT NOT NULL,
         tconst VARCHAR(10) NOT NULL,
         title_type VARCHAR(20) NOT NULL,
         primary_title TEXT NOT NULL,
         start_year SMALLINT,
         runtime_minutes INTEGER,
-        genres TEXT
+        genres TEXT,
+        PRIMARY KEY (row_num ASC)
     )
 """
 
 EPISODES_STAGE_DDL = """
     CREATE TABLE episodes_stage (
-        row_num BIGSERIAL,
+        row_num BIGINT NOT NULL,
         tconst VARCHAR(10) NOT NULL,
         parent_tconst VARCHAR(10) NOT NULL,
         season_number INTEGER,
-        episode_number INTEGER
+        episode_number INTEGER,
+        PRIMARY KEY (row_num ASC)
     )
 """
 
 RATINGS_STAGE_DDL = """
     CREATE TABLE ratings_stage (
-        row_num BIGSERIAL,
+        row_num BIGINT NOT NULL,
         tconst VARCHAR(10) NOT NULL,
         average_rating REAL NOT NULL,
-        num_votes INTEGER NOT NULL
+        num_votes INTEGER NOT NULL,
+        PRIMARY KEY (row_num ASC)
     )
 """
 
@@ -288,6 +297,19 @@ def copy_from_tsv(conn, table, path, columns):
     print(f"[DB] COPY into {table} complete in {time.time() - start:.0f}s.")
 
 
+def sort_tsv_by_tconst(path):
+    """Sort a TSV in place by its first (tconst) column in byte order.
+
+    LC_ALL=C is both much faster than a locale-aware sort and matches
+    Python's str comparison, which filter_to_titles' merge relies on.
+    """
+    env = dict(os.environ, LC_ALL="C")
+    subprocess.run(
+        ["sort", "-t", "\t", "-k1,1", "-S", "1G", "--parallel=4", "-o", path, path],
+        check=True, env=env,
+    )
+
+
 def gunzip_and_sort_by_tconst(gz_path, out_tsv):
     """Decompress a gzipped IMDb TSV, drop the header, sort by tconst.
 
@@ -300,9 +322,54 @@ def gunzip_and_sort_by_tconst(gz_path, out_tsv):
     with gzip.open(gz_path, "rb") as gz_in, open(out_tsv, "wb") as raw_out:
         gz_in.readline()  # drop header
         shutil.copyfileobj(gz_in, raw_out)
-    subprocess.run(["sort", "-k1,1", "-S", "256M", "-o", out_tsv, out_tsv], check=True)
+    sort_tsv_by_tconst(out_tsv)
     size_mb = os.path.getsize(out_tsv) / (1024 * 1024)
     print(f"[TRANSFORM] {os.path.basename(out_tsv)} ready ({size_mb:.1f} MB) in {time.time() - start:.0f}s.")
+
+
+def filter_to_titles(titles_tsv, in_tsv, out_tsv):
+    """Keep only rows of `in_tsv` whose tconst appears in `titles_tsv`.
+
+    Both inputs must be tconst-sorted in byte order; a streaming merge keeps
+    memory flat. Rows for titles we don't store (movies, shorts, ...) are
+    unreachable through the API, which always joins from `titles`.
+    """
+    print(f"[TRANSFORM] Filtering {os.path.basename(in_tsv)} to kept titles ...")
+    total = 0
+    kept = 0
+    with open(titles_tsv, "r", encoding="utf-8") as f_titles, \
+         open(in_tsv, "r", encoding="utf-8") as f_in, \
+         open(out_tsv, "w", encoding="utf-8", newline="", buffering=1 << 20) as f_out:
+        title_key = ""
+        for line in f_in:
+            total += 1
+            key = line.split("\t", 1)[0]
+            while title_key is not None and title_key < key:
+                title_line = f_titles.readline()
+                title_key = title_line.split("\t", 1)[0] if title_line else None
+            if title_key == key:
+                f_out.write(line)
+                kept += 1
+    print(f"[TRANSFORM] {os.path.basename(out_tsv)}: {kept:,} kept / {total:,} total")
+
+
+def prepare_basics(basics_gz, tmpdir):
+    basics_tsv = os.path.join(tmpdir, "basics.tsv")
+    transform_basics(basics_gz, basics_tsv)
+    print("[TRANSFORM] Sorting basics.tsv by tconst ...")
+    sort_start = time.time()
+    sort_tsv_by_tconst(basics_tsv)
+    print(f"[TRANSFORM] Sort complete in {time.time() - sort_start:.0f}s.")
+    return basics_tsv
+
+
+def prepare_ratings(ratings_gz, basics_tsv, tmpdir):
+    sorted_tsv = os.path.join(tmpdir, "ratings.sorted.tsv")
+    gunzip_and_sort_by_tconst(ratings_gz, sorted_tsv)
+    ratings_tsv = os.path.join(tmpdir, "ratings.filtered.tsv")
+    filter_to_titles(basics_tsv, sorted_tsv, ratings_tsv)
+    os.remove(sorted_tsv)
+    return ratings_tsv
 
 
 def _run_one(sql):
@@ -323,12 +390,20 @@ def drop_old_tables(conn):
     conn.commit()
 
 
-def disable_txn_writes(conn):
-    """Skip Yugabyte's distributed-txn machinery for the staging COPYs.
-    Staging tables aren't visible to readers until the per-phase swap renames
-    them, so per-row transactional guarantees buy nothing here."""
+def set_bulk_load_mode(conn, on):
+    """Toggle Yugabyte's bulk-load settings for COPYs into staging tables.
+
+    yb_disable_transactional_writes skips the distributed-txn machinery:
+    staging tables aren't visible to readers until renamed/diffed, so
+    per-row transactional guarantees buy nothing. yb_enable_upsert_mode
+    skips the read-before-write PK uniqueness check on every row; safe
+    only because the target is empty (or freshly TRUNCATEd), the input keys
+    are unique, and it has no secondary indexes at COPY time.
+    """
+    value = "ON" if on else "OFF"
     with conn.cursor() as cur:
-        cur.execute("SET yb_disable_transactional_writes = ON")
+        cur.execute(f"SET yb_disable_transactional_writes = {value}")
+        cur.execute(f"SET yb_enable_upsert_mode = {value}")
     conn.commit()
 
 
@@ -376,9 +451,9 @@ def load_and_swap_one(conn, name, ddl, tsv_path, columns, extra_indexes=()):
         cur.execute(f"DROP TABLE IF EXISTS {name}_new CASCADE")
         cur.execute(ddl)
     conn.commit()
-    disable_txn_writes(conn)
-
+    set_bulk_load_mode(conn, True)
     copy_from_tsv(conn, f"{name}_new", tsv_path, columns)
+    set_bulk_load_mode(conn, False)
 
     index_specs = list(extra_indexes)
     if index_specs:
@@ -438,7 +513,7 @@ def load_and_diff_one(conn, name, stage_ddl, tsv_path, columns, update_cols):
     # Qualify existing-row columns with the table name to avoid ambiguity
     # in ON CONFLICT DO UPDATE WHERE (required by YugabyteDB).
     where_clause = " OR ".join(f"{name}.{c} IS DISTINCT FROM EXCLUDED.{c}" for c in update_cols)
-    copy_sql = f"COPY {name}_stage ({col_list}) FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t')"
+    copy_sql = f"COPY {name}_stage (row_num, {col_list}) FROM STDIN WITH (FORMAT TEXT, DELIMITER E'\\t')"
 
     total_deleted = 0
     total_upserted = 0
@@ -461,20 +536,21 @@ def load_and_diff_one(conn, name, stage_ddl, tsv_path, columns, update_cols):
             max_t = lines[-1].split("\t", 1)[0]
             chunk_start = time.time()
 
-            # Reset stage. RESTART IDENTITY so row_num starts at 1 each
-            # chunk, letting the upsert pagination use a fixed [0..chunk_rows]
-            # range instead of tracking a global offset.
+            # Reset stage. row_num restarts at 1 each chunk, letting the
+            # upsert pagination use a fixed [0..chunk_rows] range instead of
+            # tracking a global offset.
             with conn.cursor() as cur:
-                cur.execute(f"TRUNCATE {name}_stage RESTART IDENTITY")
-                cur.execute("SET yb_disable_transactional_writes = ON")
+                cur.execute(f"TRUNCATE {name}_stage")
             conn.commit()
 
+            set_bulk_load_mode(conn, True)
             with conn.cursor() as cur:
-                cur.copy_expert(copy_sql, io.StringIO("".join(lines)))
+                data = "".join(f"{i}\t{line}" for i, line in enumerate(lines, 1))
+                cur.copy_expert(copy_sql, io.StringIO(data))
             conn.commit()
+            set_bulk_load_mode(conn, False)
 
             with conn.cursor() as cur:
-                cur.execute("SET yb_disable_transactional_writes = OFF")
                 cur.execute(f"""
                     DELETE FROM {name}
                     WHERE tconst BETWEEN %s AND %s
@@ -523,19 +599,19 @@ def load_and_diff_one(conn, name, stage_ddl, tsv_path, columns, update_cols):
 
 
 def run_incremental_load(conn, tmpdir, changed, paths):
+    # Ratings are filtered to kept titles, so a titles change must re-diff
+    # ratings too, and the ratings diff needs the titles TSV either way.
+    reload_ratings = changed["ratings"] or changed["basics"]
+    basics_tsv = None
+    if changed["basics"] or reload_ratings:
+        basics_tsv = prepare_basics(paths["basics"], tmpdir)
+
     if changed["basics"]:
-        basics_tsv = os.path.join(tmpdir, "basics.tsv")
-        transform_basics(paths["basics"], basics_tsv)
-        print("[TRANSFORM] Sorting basics.tsv by tconst ...")
-        sort_start = time.time()
-        subprocess.run(["sort", "-k1,1", "-S", "256M", "-o", basics_tsv, basics_tsv], check=True)
-        print(f"[TRANSFORM] Sort complete in {time.time() - sort_start:.0f}s.")
         load_and_diff_one(
             conn, "titles", TITLES_STAGE_DDL, basics_tsv,
             columns=("tconst", "title_type", "primary_title", "start_year", "runtime_minutes", "genres"),
             update_cols=("title_type", "primary_title", "start_year", "runtime_minutes", "genres"),
         )
-        os.remove(basics_tsv)
 
     if changed["episode"]:
         episode_tsv = os.path.join(tmpdir, "episode.sorted.tsv")
@@ -547,15 +623,17 @@ def run_incremental_load(conn, tmpdir, changed, paths):
         )
         os.remove(episode_tsv)
 
-    if changed["ratings"]:
-        ratings_tsv = os.path.join(tmpdir, "ratings.sorted.tsv")
-        gunzip_and_sort_by_tconst(paths["ratings"], ratings_tsv)
+    if reload_ratings:
+        ratings_tsv = prepare_ratings(paths["ratings"], basics_tsv, tmpdir)
         load_and_diff_one(
             conn, "ratings", RATINGS_STAGE_DDL, ratings_tsv,
             columns=("tconst", "average_rating", "num_votes"),
             update_cols=("average_rating", "num_votes"),
         )
         os.remove(ratings_tsv)
+
+    if basics_tsv:
+        os.remove(basics_tsv)
 
 
 def run_full_load(conn, tmpdir, basics_tsv, episode_gz, ratings_gz):
@@ -585,13 +663,20 @@ def run_full_load(conn, tmpdir, basics_tsv, episode_gz, ratings_gz):
     )
     os.remove(episode_tsv)
 
-    ratings_tsv = os.path.join(tmpdir, "ratings.sorted.tsv")
-    gunzip_and_sort_by_tconst(ratings_gz, ratings_tsv)
+    ratings_tsv = prepare_ratings(ratings_gz, basics_tsv, tmpdir)
     load_and_swap_one(
         conn, "ratings", RATINGS_DDL, ratings_tsv,
         ("tconst", "average_rating", "num_votes"),
     )
     os.remove(ratings_tsv)
+
+    # Fresh stats so the planner costs the new indexes (notably the trigram
+    # index for /search) correctly.
+    print("[DB] Analyzing tables ...")
+    with conn.cursor() as cur:
+        for name in ("titles", "episodes", "ratings"):
+            cur.execute(f"ANALYZE {name}")
+    conn.commit()
 
 
 def main():
@@ -640,12 +725,7 @@ def main():
                 run_incremental_load(conn, tmpdir, changed, paths)
             else:
                 # First run — no live tables yet; COPY+swap is fastest.
-                basics_tsv = os.path.join(tmpdir, "basics.tsv")
-                transform_basics(paths["basics"], basics_tsv)
-                print("[TRANSFORM] Sorting basics.tsv by tconst ...")
-                sort_start = time.time()
-                subprocess.run(["sort", "-k1,1", "-S", "256M", "-o", basics_tsv, basics_tsv], check=True)
-                print(f"[TRANSFORM] Sort complete in {time.time() - sort_start:.0f}s.")
+                basics_tsv = prepare_basics(paths["basics"], tmpdir)
                 run_full_load(conn, tmpdir, basics_tsv, paths["episode"], paths["ratings"])
 
             # Update stored hashes
