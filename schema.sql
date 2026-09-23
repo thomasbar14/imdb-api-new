@@ -3,9 +3,8 @@
 -- No SERIAL id columns — tconst is the natural primary key.
 -- PKs are range-sharded (ASC) rather than YB's default HASH so the ETL's
 -- tconst-sorted COPY and per-chunk `tconst BETWEEN` diff use range scans.
--- Search uses ILIKE, accelerated by a pg_trgm GIN index.
-
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
+-- Search uses an unindexed ILIKE scan: a pg_trgm GIN index takes ~6h to
+-- build on the free-tier node.
 
 CREATE TABLE IF NOT EXISTS titles (
     tconst VARCHAR(10) NOT NULL,
@@ -35,5 +34,3 @@ CREATE TABLE IF NOT EXISTS ratings (
 
 CREATE INDEX IF NOT EXISTS idx_episodes_parent
     ON episodes (parent_tconst HASH, season_number ASC, episode_number ASC);
-CREATE INDEX IF NOT EXISTS idx_titles_title_trgm
-    ON titles USING ybgin (primary_title gin_trgm_ops);

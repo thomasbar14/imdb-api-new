@@ -438,8 +438,7 @@ def load_and_swap_one(conn, name, ddl, tsv_path, columns, extra_indexes=()):
     plain TSV sorted by tconst.
 
     `extra_indexes` is a sequence of (final_index_name, index_spec) pairs,
-    where index_spec is everything after `ON <table>` (e.g. "(col ASC)" or
-    "USING ybgin (col gin_trgm_ops)").
+    where index_spec is everything after `ON <table>` (e.g. "(col HASH, other ASC)").
     Indexes are built on the staging table under `<final>_new` to avoid
     colliding with the same-named index attached to the live table from a
     prior run, then renamed to `<final>` atomically with the swap.
@@ -637,15 +636,12 @@ def run_incremental_load(conn, tmpdir, changed, paths):
 
 
 def run_full_load(conn, tmpdir, basics_tsv, episode_gz, ratings_gz):
-    with conn.cursor() as cur:
-        cur.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
-    conn.commit()
-
-    # Trigram index lets /search's ILIKE '%q%' avoid a full titles scan.
+    # No trigram index for /search: a ybgin gin_trgm_ops backfill measured
+    # ~475 rows/s on the free-tier node (~6h for 10M titles), past the job
+    # timeout. Search stays a plain ILIKE scan.
     load_and_swap_one(
         conn, "titles", TITLES_DDL, basics_tsv,
         ("tconst", "title_type", "primary_title", "start_year", "runtime_minutes", "genres"),
-        extra_indexes=(("idx_titles_title_trgm", "USING ybgin (primary_title gin_trgm_ops)"),),
     )
 
     episode_tsv = os.path.join(tmpdir, "episode.sorted.tsv")
